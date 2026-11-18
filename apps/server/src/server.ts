@@ -309,7 +309,11 @@ export function createProxyServer(options: ServerOptions) {
     reverseProxy: options.reverseProxy,
     host: options.host ?? '127.0.0.1',
   });
-  const serverDevice: Device = { id: web.serverDeviceId, name: '服务端', platform: 'linux' };
+  const serverDevice: Device = {
+    id: web.serverDeviceId,
+    name: '服务端',
+    platform: process.platform === 'darwin' ? 'darwin' : 'linux',
+  };
   const originOf = (request: IncomingMessage) =>
     `${options.tls || options.reverseProxy ? 'https' : 'http'}://${request.headers.host}`;
   // Behind the reverse proxy every socket comes from the proxy itself; it passes the client on in X-Real-IP.

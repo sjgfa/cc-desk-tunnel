@@ -210,7 +210,7 @@ export class NativeTerminal {
     this.process.onExit(({ exitCode }) => {
       this.flush();
       this.exited = true;
-      if (process.platform === 'linux') {
+      if (process.platform === 'linux' || process.platform === 'darwin') {
         try {
           process.kill(-this.process.pid, 'SIGKILL');
         } catch {}
@@ -352,7 +352,8 @@ export class NativeTerminal {
     if (this.paused) this.process.resume();
     // forkpty starts a separate process group; clean descendants as well as the foreground CLI.
     try {
-      if (process.platform === 'linux') process.kill(-this.process.pid, 'SIGTERM');
+      if (process.platform === 'linux' || process.platform === 'darwin')
+        process.kill(-this.process.pid, 'SIGTERM');
       else this.process.kill();
     } catch {
       try {
@@ -361,7 +362,8 @@ export class NativeTerminal {
     }
     this.killTimer = setTimeout(() => {
       try {
-        if (process.platform === 'linux') process.kill(-this.process.pid, 'SIGKILL');
+        if (process.platform === 'linux' || process.platform === 'darwin')
+          process.kill(-this.process.pid, 'SIGKILL');
         else this.process.kill();
       } catch {}
     }, 2000);

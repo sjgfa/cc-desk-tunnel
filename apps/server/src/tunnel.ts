@@ -127,10 +127,11 @@ export function sshProbe(configPath: string, host: string) {
 }
 // Where the commands of one device share an SSH connection, or nothing when they cannot: the `ssh` of Windows,
 // which tests run this service with, has no connection sharing, and the path of a Unix socket is limited to
-// 108 bytes, of which `ssh` takes 17 for the name it binds under before renaming.
+// 108 bytes on Linux and 104 on macOS, of which `ssh` takes 17 for the temporary name before renaming.
 export function sharedConnectionPath(directory: string, platform = process.platform) {
   const path = join(directory, 'mux');
-  return platform !== 'win32' && Buffer.byteLength(path) <= 88 ? path : undefined;
+  const limit = platform === 'darwin' ? 84 : 88;
+  return platform !== 'win32' && Buffer.byteLength(path) <= limit ? path : undefined;
 }
 export function sshConfig(
   directory: string,

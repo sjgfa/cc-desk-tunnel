@@ -155,7 +155,7 @@ export async function runClaude(
   options: ClaudeOptions,
   run: ClaudeRun,
 ): Promise<'completed' | 'failed' | 'cancelled'> {
-  if (process.platform === 'win32') throw new Error('Native adapter must run on Linux.');
+  if (process.platform === 'win32') throw new Error('Native adapter requires Linux or macOS.');
   const mapper = new ClaudeStream(run.emit, run.permissionMode, run.effort);
   const cwd = prepareNativeDirectory(options, run.dataDir, run.nativeRoot);
   if (run.resume && !(await getSessionInfo(run.sessionId, { dir: cwd }))) {

@@ -106,6 +106,10 @@ test('commands share one SSH connection where the platform and the length of the
   assert.match(shared, /ControlPersist \d+/);
   assert.doesNotMatch(config('/tmp/private', 'win32'), /Control/);
   assert.doesNotMatch(config(`/srv/${'long-name/'.repeat(9)}connections/id`, 'linux'), /Control/);
+  const macLimit = `/${'a'.repeat(80)}`; // 85 bytes once /mux is added.
+  assert.match(config(macLimit, 'linux'), /ControlMaster auto/);
+  assert.doesNotMatch(config(macLimit, 'darwin'), /Control/);
+  assert.match(config('/tmp/private', 'darwin'), /ControlMaster auto/);
 });
 test('context names the hosts of the device as plain SSH aliases without inventing execution tools', () => {
   const prompt = remotePrompt(
