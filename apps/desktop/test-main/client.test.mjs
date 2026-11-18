@@ -194,6 +194,85 @@ test('a failed partial snapshot cannot let later live events skip missing histor
   assert.equal(socket.sent.at(-1).afterSequence, 0);
 });
 
+test('a stopped run is shown immediately even if its partial history later fails', async (t) => {
+  const { client, socket, sessions } = fixture(t);
+  const session = {
+    ...sessions[0],
+    activeRun: { id: randomUUID(), status: 'running', connectionId: randomUUID() },
+  };
+  socket.message({ type: 'session.updated', session });
+  client.select(session.id);
+  const request = socket.sent.at(-1);
+  socket.message({
+    type: 'session.history.part',
+    requestId: request.requestId,
+    sessionId: session.id,
+    data: '[',
+    last: false,
+  });
+  socket.message({ type: 'session.updated', session: { ...session, activeRun: null } });
+  assert.equal(client.state.sessions.find((item) => item.id === session.id).activeRun, null);
+  socket.message({
+    type: 'response',
+    requestId: request.requestId,
+    ok: false,
+    message: '历史停滞',
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(client.state.sessions.find((item) => item.id === session.id).activeRun, null);
+  assert.equal(client.state.history[session.id].needsReload, true);
+});
+
+for (const mode of ['replace', 'prepend']) {
+  test(`a delayed ${mode} history page cannot restore a stopped run`, async (t) => {
+    const { client, socket, sessions, snapshot } = fixture(t);
+    const session = {
+      ...sessions[0],
+      activeRun: { id: randomUUID(), status: 'running', connectionId: randomUUID() },
+    };
+    socket.message({ type: 'session.updated', session });
+    client.select(session.id);
+    let loading;
+    if (mode === 'prepend') {
+      snapshot(session, [event(session.id, 100)], { firstSequence: 51, hasEarlier: true });
+      loading = client.loadEarlier(session.id);
+    }
+    const request = socket.sent.at(-1);
+    const page = JSON.stringify([
+      {
+        type: 'session.snapshot',
+        requestId: request.requestId,
+        session,
+        events: [event(session.id, 50)],
+        mode,
+        firstSequence: 1,
+        lastSequence: 50,
+        hasEarlier: false,
+      },
+    ]);
+    socket.message({
+      type: 'session.history.part',
+      requestId: request.requestId,
+      sessionId: session.id,
+      data: page.slice(0, 80),
+      last: false,
+    });
+    const stopped = { ...session, activeRun: null };
+    socket.message({ type: 'session.updated', session: stopped });
+    socket.message({
+      type: 'session.history.part',
+      requestId: request.requestId,
+      sessionId: session.id,
+      data: page.slice(80),
+      last: true,
+    });
+    socket.message({ type: 'response', requestId: request.requestId, ok: true });
+    await loading;
+    assert.equal(client.state.sessions.find((item) => item.id === session.id).activeRun, null);
+    assert.ok(client.state.events[session.id].some((item) => item.sequence === 50));
+  });
+}
+
 test('switching cancels old history, ignores its late error and avoids duplicate subscriptions while loading', async (t) => {
   const { client, socket, sessions } = fixture(t);
   const [a, b] = sessions;

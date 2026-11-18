@@ -243,6 +243,7 @@ export class ProxyClient {
       renew: () => void;
       parts?: string[];
       following?: ServerMessage[];
+      sessionUpdated?: boolean;
       done?: Promise<Response>;
       command?: NewCommand;
     }
@@ -466,16 +467,22 @@ export class ProxyClient {
         return;
       }
       if (message.type === 'session.deleted') this.cancelHistory(message.sessionId);
+      // Run state must not wait for history: stopping still takes effect if that read stalls or
+      // fails. Its captured session must also not overwrite a newer live update when it arrives.
+      if (message.type === 'session.updated') {
+        for (const request of this.pending.values())
+          if (request.sessionId === message.session.id) request.sessionUpdated = true;
+        this.upsert(message.session);
+        return;
+      }
       // A subscribing snapshot replaces live state. Preserve the events which followed its
       // captured boundary until the whole snapshot and its unfinished fragment have arrived.
       const sessionId =
         message.type === 'session.event'
           ? message.event.sessionId
-          : message.type === 'session.updated'
-            ? message.session.id
-            : message.type === 'session.fragment'
-              ? message.sessionId
-              : undefined;
+          : message.type === 'session.fragment'
+            ? message.sessionId
+            : undefined;
       if (sessionId) {
         const reading = [...this.pending.values()].find(
           (request) =>
@@ -590,8 +597,6 @@ export class ProxyClient {
         );
       } else if (message.type === 'devices') {
         this.update({ devices: message.devices });
-      } else if (message.type === 'session.updated') {
-        this.upsert(message.session);
       } else if (message.type === 'session.deleted') {
         this.disk.drop(message.sessionId);
         const events = { ...this.state.events };
@@ -617,7 +622,7 @@ export class ProxyClient {
           !this.state.sessions.some((session) => session.id === message.session.id)
         )
           return;
-        this.upsert(message.session);
+        if (!request.sessionUpdated) this.upsert(message.session);
         const id = message.session.id;
         // History up to now ends where unfinished output begins; the service sends that again, whole.
         if (message.mode !== 'prepend' && this.state.live[id]) {
