@@ -1,5 +1,7 @@
 # CC Desk Tunnel（CC 桌面隧道）
 
+> 本 fork 维护 macOS 原生服务适配和客户端修复，基线为上游 v0.3.16。改动及后续合并步骤见 [Fork 维护说明](FORK.md)。
+
 **简体中文** | [English](README.en.md)
 
 用桌面客户端驱动云端的 Claude Code，经反向隧道在你的 Windows 本机执行。

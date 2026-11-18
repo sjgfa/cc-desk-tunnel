@@ -4,6 +4,7 @@ artifacts
 .local
 .tools
 apps/desktop/vendor
+apps/server/web
 package-lock.json
 *.md
 *.yml
