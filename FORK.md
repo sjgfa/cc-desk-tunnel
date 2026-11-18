@@ -6,6 +6,7 @@
 
 - `main`：保留 fork 创建时的上游主分支，后续可同步上游。
 - `custom/stable`：维护本 fork 的 macOS 原生服务适配和客户端修复，初始基于正式版 `v0.3.16`，提交 `8127b58efaaca490d58a9188aebb5107249961a8`，协议 27。
+- `windows-client`：Windows 端维护的客户端分支。创建 `custom/stable` 时已存在，保留其提交和维护说明；两个分支中的停止状态修复与回归测试内容一致。Windows 端的记录见该分支的 `FORK-MAINTENANCE.md`。
 - `origin`：本 fork；`upstream`：原项目。日常改动推送到 `origin`。
 
 上游主分支可能包含尚未正式发布的改动。升级采用明确的正式版本标签，避免只点 GitHub 的 Sync fork 就以为定制分支和部署已经完成升级。
@@ -53,6 +54,8 @@ chmod u+x node_modules/node-pty/prebuilds/darwin-arm64/spawn-helper
 ```
 
 通过验证后，将升级分支合入 `custom/stable` 并推送。部署仍是单独步骤：备份配置和数据库，确认正在运行的任务可中断，生成同版本网页资源和客户端，再切换服务、验证 TLS、SSH、终端和历史完整性。不要移动或重建上游版本标签。
+
+Windows 端也需要按相同的正式版本更新 `windows-client` 并验证打包。两个分支的协议版本及共同客户端修复应保持一致；本 fork 不会自动合并或覆盖另一端尚未检查的提交。
 
 ## Windows 客户端
 
