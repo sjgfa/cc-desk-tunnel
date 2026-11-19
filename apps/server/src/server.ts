@@ -64,6 +64,7 @@ import {
 } from './claude.ts';
 import type { ClaudeOptions, Unanswered } from './claude.ts';
 import { ClientReleases } from './client-release.ts';
+import { sendControl } from './control-send.ts';
 import { DomainError } from './errors.ts';
 import { HistoryDelivery } from './history-delivery.ts';
 import type { NativeLogin } from './native-account.ts';
@@ -422,11 +423,7 @@ export function createProxyServer(options: ServerOptions) {
   });
 
   function send(peer: Peer, message: ServerMessage) {
-    // History benefits from compression; small live events and control replies do not need it.
-    if (peer.socket.readyState === WebSocket.OPEN)
-      peer.socket.send(JSON.stringify(message), {
-        compress: message.type === 'session.snapshot' || message.type === 'session.history.part',
-      });
+    sendControl(peer.socket, message);
   }
   function broadcast(message: ServerMessage, sessionId?: string) {
     for (const peer of peers) {
