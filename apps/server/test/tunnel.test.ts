@@ -2,9 +2,17 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { Door, shellCommand, shellsOf, sshConfig, sessionSsh, Tunnel } from '../src/tunnel.ts';
 import { execFileSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, rmSync, existsSync, readFileSync, writeFileSync } from 'node:fs';
+import {
+  mkdirSync,
+  mkdtempSync,
+  rmSync,
+  existsSync,
+  readFileSync,
+  statSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { connect } from 'node:net';
 import type { Socket } from 'node:net';
 import { once } from 'node:events';
@@ -64,10 +72,10 @@ async function harness(t: TestContext, pairMs = 5000) {
       return requests;
     },
     // Opens the device's end of a channel and attaches the service's end; resolves to the device's end.
-    async open(channelId: string) {
+    async open(channelId: string, autoPong = true) {
       const path = `/${randomUUID()}`;
       const accepted = new Promise<WebSocket>((resolve) => arrivals.set(path, resolve));
-      const device = new WebSocket(url + path);
+      const device = new WebSocket(url + path, { autoPong });
       const service = await accepted;
       await once(device, 'open');
       return { device, service, attached: tunnel.attach(channelId, service) };
@@ -287,6 +295,44 @@ test('an SSH connection asks for one channel and is joined to it byte for byte, 
   assert.equal(received().equals(inbound), true);
   assert.equal(device.requests.length, 1);
 });
+test(
+  'SSH upload waits for device receipts, ignores unrelated pongs and drains the tail before close',
+  { timeout: 5000 },
+  async (t) => {
+    const f = await harness(t);
+    const ssh = f.ssh();
+    const { device } = await f.open((await f.requested(1))[0]!, false);
+    const payload = randomBytes(512 * 1024 + 37);
+    const received: Buffer[] = [];
+    const marks: Buffer[] = [];
+    let release = false;
+    let bytes = 0;
+    device.on('message', (data: Buffer) => {
+      received.push(data);
+      bytes += data.length;
+    });
+    device.on('ping', (mark: Buffer) => {
+      marks.push(mark);
+      if (release) device.pong(mark);
+    });
+    const ended = once(device, 'close');
+    ssh.end(payload);
+    while (marks.length < 2) await delay(5);
+    const held = bytes;
+    assert.ok(held > 0 && held < payload.length);
+    device.pong();
+    device.pong('unrelated');
+    await delay(35);
+    assert.equal(bytes, held);
+    release = true;
+    // WebSocket permits a receiver to answer only the most recent ping.
+    device.pong(marks.at(-1)!);
+    await ended;
+    assert.deepEqual(Buffer.concat(received), payload);
+    assert.equal(Number(marks.at(-1)!.toString()), payload.length);
+  },
+);
+
 test('concurrent SSH connections each get their own channel, whatever order the device answers in', async (t) => {
   const device = await harness(t);
   const sockets = Array.from({ length: 20 }, () => device.ssh());
@@ -496,6 +542,42 @@ test('a device keeps one door: commands begun while it is away wait for its next
   await closed(lost);
   assert.ok(Date.now() - began >= 300);
 });
+test(
+  'a long device directory still gets a private SSH control socket, scoped to the current tunnel',
+  { skip: process.platform === 'win32' },
+  async (t) => {
+    const first = await harness(t);
+    const second = await harness(t);
+    const temp = mkdtempSync(join(tmpdir(), 'ccdt-long-door-'));
+    const door = new Door({}, join(temp, 'long-device-directory-'.repeat(5)), randomUUID());
+    await door.start();
+    t.after(async () => {
+      await door.close();
+      rmSync(temp, { recursive: true, force: true });
+    });
+    function select(tunnel: Tunnel) {
+      tunnel.credentials = {
+        type: 'tunnel.credentials',
+        connectionId: tunnel.id,
+        username: 'tester',
+        hostPublicKey: 'ssh-ed25519 unused',
+        privateKey: 'unused',
+        shells: ['pwsh'],
+      };
+      door.use(tunnel);
+      const config = readFileSync(door.ssh!.configPath, 'utf8');
+      const shared = /^  ControlPath "(.+)"$/m.exec(config)?.[1];
+      assert.ok(shared && Buffer.byteLength(shared) <= 84);
+      return shared;
+    }
+    const path = select(first.tunnel);
+    assert.equal(statSync(dirname(path)).mode & 0o777, 0o700);
+    assert.notEqual(select(second.tunnel), path);
+    await door.close();
+    assert.equal(existsSync(dirname(path)), false);
+  },
+);
+
 test('the prompt lets the model look at a picture of the device by copying that one file here', () => {
   const prompt = remotePrompt('D:\\work', 'session', windows);
   assert.match(prompt, /copy that one file with scp to a temporary file on this host/);

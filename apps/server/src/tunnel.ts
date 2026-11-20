@@ -1,5 +1,5 @@
 import { execFile } from 'node:child_process';
-import { existsSync, mkdirSync, writeFileSync, renameSync, rmSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, writeFileSync, renameSync, rmSync } from 'node:fs';
 import { createServer } from 'node:net';
 import type { AddressInfo, Server, Socket } from 'node:net';
 import { delimiter, join } from 'node:path';
@@ -14,6 +14,7 @@ import type {
   TunnelCredentials,
 } from '@cc-desk-tunnel/protocol';
 import { systemShell } from './device-terms.ts';
+import { sendSshBytes } from './channel-flow.ts';
 
 export type TunnelOptions = {
   // How long an SSH connection waits for the device to open its channel before it is dropped.
@@ -30,6 +31,9 @@ export type SshConnection = { configPath: string; bin?: string };
 // device's commands need; they bound what a stray local process connecting to the port can make the device do.
 const MAX_WAITING = 32;
 const MAX_CHANNELS = 128;
+// A desktop TLS dial alone may take 15 seconds. Allow for that and for the
+// channel request to reach the device on a busy link.
+const PAIR_MS = 25_000;
 // How long a channel whose SSH connection ended has to deliver the rest and close.
 const CLOSING_MS = 10_000;
 
@@ -113,7 +117,7 @@ export function sshProbe(configPath: string, host: string) {
     const child = execFile(
       'ssh',
       ['-F', configPath, host],
-      { timeout: 20000, maxBuffer: 65536 },
+      { timeout: PAIR_MS + 10_000, maxBuffer: 65536 },
       (error, stdout) => {
         if (error || !stdout.includes('CC_DESK_TUNNEL_SSH_READY'))
           reject(new Error('Device SSH probe failed.'));
@@ -128,8 +132,8 @@ export function sshProbe(configPath: string, host: string) {
 // Where the commands of one device share an SSH connection, or nothing when they cannot: the `ssh` of Windows,
 // which tests run this service with, has no connection sharing, and the path of a Unix socket is limited to
 // 108 bytes on Linux and 104 on macOS, of which `ssh` takes 17 for the temporary name before renaming.
-export function sharedConnectionPath(directory: string, platform = process.platform) {
-  const path = join(directory, 'mux');
+export function sharedConnectionPath(directory: string, platform = process.platform, name = 'mux') {
+  const path = join(directory, name);
   const limit = platform === 'darwin' ? 84 : 88;
   return platform !== 'win32' && Buffer.byteLength(path) <= limit ? path : undefined;
 }
@@ -144,10 +148,10 @@ export function sshConfig(
   // The system of the device and its shells, which decide what its scripts are run by.
   device: DevicePlatform = 'win32',
   shells: DeviceShell[] = [systemShell(device)],
+  shared: string | null | undefined = sharedConnectionPath(directory, platform),
 ) {
   if (directory.includes('\n') || directory.includes('"'))
     throw new Error('Unsupported data directory');
-  const shared = sharedConnectionPath(directory, platform);
   return {
     knownHosts: `[127.0.0.1]:${port} ${hostPublicKey}\n`,
     config: [
@@ -190,13 +194,17 @@ export function sshConfig(
 function splice(socket: Socket, channel: WebSocket) {
   const stream = createWebSocketStream(channel);
   stream.on('error', () => socket.destroy());
-  // What ssh sent before it went goes on first; a channel that does not answer its end is cut after a while.
-  socket.once('close', () => {
+  // Start the close deadline after the device has received even the last partial window.
+  sendSshBytes(socket, channel, () => {
+    if (channel.readyState === channel.OPEN) {
+      const cut = setTimeout(() => stream.destroy(), CLOSING_MS).unref();
+      stream.once('close', () => clearTimeout(cut));
+    }
     stream.end();
-    const cut = setTimeout(() => stream.destroy(), CLOSING_MS);
-    stream.once('close', () => clearTimeout(cut));
   });
-  socket.pipe(stream);
+  socket.once('close', () => {
+    if (!socket.readableEnded) stream.destroy();
+  });
   stream.pipe(socket);
 }
 
@@ -233,7 +241,7 @@ export class Tunnel {
   ) {
     this.id = id;
     this.directory = join(dataDir, 'connections', id);
-    this.pairMs = options.pairMs ?? 10000;
+    this.pairMs = options.pairMs ?? PAIR_MS;
     this.probe = options.probe ?? sshProbe;
     this.request = request;
     this.unexpectedClose = unexpectedClose;
@@ -305,7 +313,7 @@ export class Tunnel {
       credentials.username,
       credentials.hostPublicKey,
       process.platform,
-      15,
+      Math.ceil(this.pairMs / 1000) + 5,
       platform,
       this.shells,
     );
@@ -367,6 +375,7 @@ export class Door {
   private tunnel?: Tunnel;
   private held = new Map<Socket, NodeJS.Timeout>();
   private closed = false;
+  private muxDirectory?: string;
   constructor(options: TunnelOptions, dataDir: string, device: string) {
     this.directory = join(dataDir, 'devices', device);
     this.holdMs = options.holdMs ?? 60000;
@@ -401,6 +410,22 @@ export class Door {
       });
     }
   }
+  // A reconnect may select another live tunnel. Commands on the old master may
+  // finish there, but new commands must use the current tunnel's credentials.
+  private controlPath(tunnel: Tunnel) {
+    if (process.platform === 'win32') return null;
+    const name = `m-${tunnel.id}`;
+    const path = sharedConnectionPath(this.directory, process.platform, name);
+    if (path) return path;
+    // Keep the socket path short even under a long deployment directory. Only
+    // sockets go in this private directory, which mkdtemp creates with mode 0700.
+    try {
+      this.muxDirectory ??= mkdtempSync('/tmp/ccdt-mux-');
+      return sharedConnectionPath(this.muxDirectory, process.platform, name) ?? null;
+    } catch {
+      return null;
+    }
+  }
   // The tunnel that carries the device's commands from now on, or none while the device is away. Its keys
   // replace the ones here; SSH connections that were waiting go to it.
   use(tunnel: Tunnel | undefined) {
@@ -417,6 +442,7 @@ export class Door {
       Math.ceil(this.holdMs / 1000) + 15,
       tunnel.platform,
       tunnel.shells,
+      this.controlPath(tunnel),
     );
     const write = (name: string, text: string) => {
       const next = join(this.directory, `${name}.${randomBytes(6).toString('hex')}`);
@@ -451,5 +477,6 @@ export class Door {
     for (const socket of this.held.keys()) socket.destroy();
     await closed;
     rmSync(this.directory, { recursive: true, force: true });
+    if (this.muxDirectory) rmSync(this.muxDirectory, { recursive: true, force: true });
   }
 }
