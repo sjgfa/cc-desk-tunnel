@@ -25,7 +25,7 @@ export type TunnelOptions = {
   holdMs?: number;
 };
 // `bin`, for a session, holds the `ssh`, `scp` and `sftp` its CLI finds first on its PATH.
-export type SshConnection = { configPath: string; bin?: string };
+export type SshConnection = { configPath: string; fileConfigPath?: string; bin?: string };
 
 // SSH connections that may wait for their channel at once, and that may be open at once. Far above what one
 // device's commands need; they bound what a stray local process connecting to the port can make the device do.
@@ -57,19 +57,19 @@ export function sessionSsh(dataDir: string, sessionId: string, ssh: SshConnectio
     writeFileSync(next, text, { mode });
     renameSync(next, path);
   };
-  write(
-    configPath,
-    `Include ${JSON.stringify(ssh.configPath)}\nHost * !device !device-*\n  Include ~/.ssh/config /etc/ssh/ssh_config\n`,
-    0o600,
-  );
+  const include = (path: string) =>
+    `Include ${JSON.stringify(path)}\nHost * !device !device-*\n  Include ~/.ssh/config /etc/ssh/ssh_config\n`;
+  write(configPath, include(ssh.configPath), 0o600);
+  const fileConfigPath = ssh.fileConfigPath ? join(directory, 'files.conf') : configPath;
+  if (ssh.fileConfigPath) write(fileConfigPath, include(ssh.fileConfigPath), 0o600);
   const quote = (value: string) => `'${value.replaceAll("'", "'\\''")}'`;
   for (const name of ['ssh', 'scp', 'sftp'])
     write(
       join(bin, name),
-      `#!/bin/sh\nexec ${quote(program(name))} -F ${quote(configPath)} "$@"\n`,
+      `#!/bin/sh\nexec ${quote(program(name))} -F ${quote(name === 'ssh' ? configPath : fileConfigPath)} "$@"\n`,
       0o700,
     );
-  return { configPath, bin };
+  return { configPath, fileConfigPath, bin };
 }
 // The program on this service's PATH, which a session's own come before.
 function program(name: string) {
@@ -137,6 +137,24 @@ export function sharedConnectionPath(directory: string, platform = process.platf
   const limit = platform === 'darwin' ? 84 : 88;
   return platform !== 'win32' && Buffer.byteLength(path) <= limit ? path : undefined;
 }
+class SshSockets {
+  private temporary?: string;
+  path(directory: string, name: string) {
+    if (process.platform === 'win32') return null;
+    const path = sharedConnectionPath(directory, process.platform, name);
+    if (path) return path;
+    // Only sockets go in this private directory, which mkdtemp creates with mode 0700.
+    try {
+      this.temporary ??= mkdtempSync('/tmp/ccdt-mux-');
+      return sharedConnectionPath(this.temporary, process.platform, name) ?? null;
+    } catch {
+      return null;
+    }
+  }
+  close() {
+    if (this.temporary) rmSync(this.temporary, { recursive: true, force: true });
+  }
+}
 export function sshConfig(
   directory: string,
   port: number,
@@ -149,6 +167,7 @@ export function sshConfig(
   device: DevicePlatform = 'win32',
   shells: DeviceShell[] = [systemShell(device)],
   shared: string | null | undefined = sharedConnectionPath(directory, platform),
+  persist: number | 'yes' = 600,
 ) {
   if (directory.includes('\n') || directory.includes('"'))
     throw new Error('Unsupported data directory');
@@ -182,7 +201,7 @@ export function sshConfig(
       // The first command opens a connection that the following ones run over, and that stays for a while
       // after the last; it ends with the tunnel, whose close cuts it.
       ...(shared
-        ? ['  ControlMaster auto', `  ControlPath "${shared}"`, '  ControlPersist 600']
+        ? ['  ControlMaster auto', `  ControlPath "${shared}"`, `  ControlPersist ${persist}`]
         : []),
       '',
     ].join('\n'),
@@ -217,6 +236,8 @@ export class Tunnel {
   id: string;
   port = 0;
   ssh?: SshConnection;
+  fileMaster?: string;
+  private sockets = new SshSockets();
   controller = new AbortController();
   closePromise?: Promise<void>;
   // What the device registered with, once its SSH service answered through this tunnel.
@@ -307,6 +328,9 @@ export class Tunnel {
       throw new Error('Inactive SSH registration');
     this.platform = platform;
     this.shells = shellsOf(platform, credentials.shells);
+    // scp and sftp join existing masters but invoke ssh with ControlMaster=no.
+    // Keep the SSH connection we must open for readiness as their transfer connection.
+    this.fileMaster = this.sockets.path(this.directory, 'mux') ?? undefined;
     const files = sshConfig(
       this.directory,
       this.port,
@@ -316,6 +340,8 @@ export class Tunnel {
       Math.ceil(this.pairMs / 1000) + 5,
       platform,
       this.shells,
+      this.fileMaster ?? null,
+      'yes',
     );
     const configPath = join(this.directory, 'ssh_config');
     writeFileSync(join(this.directory, 'identity'), credentials.privateKey, { mode: 0o600 });
@@ -352,6 +378,7 @@ export class Tunnel {
       await closed;
       this.ssh = undefined;
       rmSync(this.directory, { recursive: true, force: true });
+      this.sockets.close();
     })();
     return this.closePromise;
   }
@@ -375,7 +402,7 @@ export class Door {
   private tunnel?: Tunnel;
   private held = new Map<Socket, NodeJS.Timeout>();
   private closed = false;
-  private muxDirectory?: string;
+  private sockets = new SshSockets();
   constructor(options: TunnelOptions, dataDir: string, device: string) {
     this.directory = join(dataDir, 'devices', device);
     this.holdMs = options.holdMs ?? 60000;
@@ -410,22 +437,6 @@ export class Door {
       });
     }
   }
-  // A reconnect may select another live tunnel. Commands on the old master may
-  // finish there, but new commands must use the current tunnel's credentials.
-  private controlPath(tunnel: Tunnel) {
-    if (process.platform === 'win32') return null;
-    const name = `m-${tunnel.id}`;
-    const path = sharedConnectionPath(this.directory, process.platform, name);
-    if (path) return path;
-    // Keep the socket path short even under a long deployment directory. Only
-    // sockets go in this private directory, which mkdtemp creates with mode 0700.
-    try {
-      this.muxDirectory ??= mkdtempSync('/tmp/ccdt-mux-');
-      return sharedConnectionPath(this.muxDirectory, process.platform, name) ?? null;
-    } catch {
-      return null;
-    }
-  }
   // The tunnel that carries the device's commands from now on, or none while the device is away. Its keys
   // replace the ones here; SSH connections that were waiting go to it.
   use(tunnel: Tunnel | undefined) {
@@ -433,6 +444,8 @@ export class Door {
     this.tunnel = tunnel;
     if (!tunnel?.credentials) return;
     const { username, hostPublicKey, privateKey } = tunnel.credentials;
+    // A newly selected tunnel has its own credentials; don't reuse a previous master.
+    const shared = this.sockets.path(this.directory, `m-${tunnel.id}`);
     const files = sshConfig(
       this.directory,
       this.port,
@@ -442,7 +455,7 @@ export class Door {
       Math.ceil(this.holdMs / 1000) + 15,
       tunnel.platform,
       tunnel.shells,
-      this.controlPath(tunnel),
+      shared,
     );
     const write = (name: string, text: string) => {
       const next = join(this.directory, `${name}.${randomBytes(6).toString('hex')}`);
@@ -452,7 +465,16 @@ export class Door {
     write('identity', privateKey);
     write('known_hosts', files.knownHosts);
     write('ssh_config', files.config);
-    this.ssh = { configPath: join(this.directory, 'ssh_config') };
+    // Keep file transfers off the command master: its local TCP socket can already
+    // hold queued SSH bytes even when the WebSocket sender is correctly paced.
+    const configPath = join(this.directory, 'ssh_config');
+    const fileConfigPath = join(this.directory, 'ssh_file_config');
+    const fileMaster =
+      tunnel.fileMaster || shared
+        ? `Host device\n  ControlPath ${JSON.stringify(tunnel.fileMaster ?? 'none')}\nHost *\n`
+        : '';
+    write('ssh_file_config', `${fileMaster}Include ${JSON.stringify(configPath)}\n`);
+    this.ssh = { configPath, fileConfigPath };
     for (const [socket, timer] of this.held) {
       clearTimeout(timer);
       this.held.delete(socket);
@@ -477,6 +499,6 @@ export class Door {
     for (const socket of this.held.keys()) socket.destroy();
     await closed;
     rmSync(this.directory, { recursive: true, force: true });
-    if (this.muxDirectory) rmSync(this.muxDirectory, { recursive: true, force: true });
+    this.sockets.close();
   }
 }
