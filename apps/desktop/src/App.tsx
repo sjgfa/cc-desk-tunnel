@@ -371,7 +371,12 @@ export function App({
     (session) => session.activeRun && session.activeRun.surface !== 'terminal',
   );
   const controlsDisabled =
-    !connected || busy || refreshing || !!selected?.activeRun || !!history?.loading;
+    !connected ||
+    busy ||
+    refreshing ||
+    !!selected?.activeRun ||
+    !!history?.loading ||
+    !!history?.needsReload;
   // A run is that of the computer its session is on, whichever window of whichever computer started it; any
   // of them answers and stops it while that computer can be reached.
   const ownsRun = !!selected?.activeRun && (!away || remote);
@@ -380,6 +385,7 @@ export function App({
     !connected ||
     busy ||
     !!history?.loading ||
+    !!history?.needsReload ||
     selected?.activeRun?.surface === 'terminal' ||
     (!!selected?.activeRun && (!nativeMode || !ownsRun)) ||
     refreshing;
@@ -626,6 +632,7 @@ export function App({
       !selected ||
       !connected ||
       history?.loading ||
+      history?.needsReload ||
       selected.activeRun ||
       anyChat ||
       refreshed.current.has(selected.id)
@@ -633,7 +640,15 @@ export function App({
       return;
     refreshed.current.add(selected.id);
     void refreshStatus(selected.id);
-  }, [nativeMode, selected?.id, connected, history?.loading, selected?.activeRun, anyChat]);
+  }, [
+    nativeMode,
+    selected?.id,
+    connected,
+    history?.loading,
+    history?.needsReload,
+    selected?.activeRun,
+    anyChat,
+  ]);
   useEffect(() => {
     if (nativeMode && connected) void client.request({ type: 'account.status' }).catch(() => {});
   }, [nativeMode, connected, accountOpen]);
@@ -1778,6 +1793,8 @@ export function App({
                 void newSession();
               }}
               loadEarlier={() => client.loadEarlier(selected!.id)}
+              retryHistory={() => client.retryHistory(selected!.id)}
+              pauseHistory={() => client.pauseHistory(selected!.id)}
               edit={
                 controlsDisabled || away
                   ? undefined

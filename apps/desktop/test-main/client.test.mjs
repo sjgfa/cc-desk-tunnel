@@ -273,6 +273,185 @@ for (const mode of ['replace', 'prepend']) {
   });
 }
 
+test('failed incremental history resumes at the complete prefix, not later live events or zero', async (t) => {
+  const { client, socket, sessions, snapshot } = fixture(t);
+  const session = sessions[0];
+  const first = event(session.id, 10);
+  client.select(session.id);
+  snapshot(session, [first]);
+  client.select(session.id);
+  const request = socket.sent.at(-1);
+  socket.message({
+    type: 'session.history.part',
+    requestId: request.requestId,
+    sessionId: session.id,
+    data: '[',
+    last: false,
+  });
+  assert.equal(client.state.history[session.id].receivedParts, 1);
+  socket.message({
+    type: 'response',
+    requestId: request.requestId,
+    ok: false,
+    message: '历史停滞',
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  socket.message({ type: 'session.event', event: event(session.id, 40) });
+  await new Promise((resolve) => setTimeout(resolve, 40));
+  client.retryHistory(session.id);
+  const retry = socket.sent.at(-1);
+  assert.equal(retry.afterSequence, 10);
+  assert.equal(retry.afterCreatedAt, first.createdAt);
+  assert.equal(client.state.history[session.id].receivedParts, 0);
+  snapshot(session, [event(session.id, 20), event(session.id, 40)], { mode: 'append' });
+  assert.deepEqual(
+    client.state.events[session.id].map((item) => item.sequence),
+    [10, 20, 40],
+  );
+  assert.equal(client.state.history[session.id].needsReload, undefined);
+});
+
+test('pausing history keeps cached events and does not cancel or replay a write', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const { client, socket, sessions, snapshot } = fixture(t);
+  const session = sessions[0];
+  client.select(session.id);
+  snapshot(session, [event(session.id, 10)]);
+  const write = client
+    .request({ type: 'message.send', sessionId: session.id, text: 'once' })
+    .catch((error) => error);
+  client.select(session.id);
+  const request = socket.sent.at(-1);
+  client.pauseHistory(session.id);
+  assert.equal(client.state.history[session.id].loading, false);
+  assert.equal(client.state.history[session.id].needsReload, true);
+  assert.equal(client.state.events[session.id].length, 1);
+  assert.match(client.state.history[session.id].error, /已暂停/);
+  await assert.rejects(client.waitForHistory(session.id), /尚未完整加载/);
+  client.retryHistory(session.id);
+  socket.message({
+    type: 'session.history.part',
+    requestId: request.requestId,
+    sessionId: session.id,
+    data: '[',
+    last: false,
+  });
+  await Promise.resolve();
+  assert.equal(client.state.history[session.id].loading, true);
+  assert.equal(client.state.history[session.id].receivedParts, 0);
+  t.mock.timers.tick(10001);
+  assert.match((await write).message, /请求超时/);
+  assert.equal(socket.sent.filter((item) => item.type === 'message.send').length, 1);
+  assert.equal(
+    socket.sent.some((item) => item.type === 'run.cancel' || item.type === 'leave'),
+    false,
+  );
+});
+
+test('a paused read stays paused across selection and resumes only when requested', async (t) => {
+  const { client, socket, sessions } = fixture(t);
+  const session = sessions[0];
+  client.select(session.id);
+  client.pauseHistory(session.id);
+  client.select(sessions[1].id);
+  client.select(session.id);
+  assert.equal(
+    socket.sent.filter((item) => item.type === 'session.subscribe' && item.sessionId === session.id)
+      .length,
+    1,
+  );
+  assert.equal(client.state.history[session.id].paused, true);
+  client.retryHistory(session.id);
+  assert.equal(client.state.history[session.id].paused, undefined);
+  assert.equal(socket.sent.at(-1).sessionId, session.id);
+});
+
+test('retrying a failed earlier page fetches that page instead of clearing its error with a latest read', async (t) => {
+  const { client, socket, sessions, snapshot } = fixture(t);
+  const session = sessions[0];
+  client.select(session.id);
+  snapshot(session, [event(session.id, 50)], { hasEarlier: true });
+  const earlier = client.loadEarlier(session.id);
+  await Promise.resolve();
+  const request = socket.sent.at(-1);
+  const rejected = assert.rejects(earlier, /earlier failed/);
+  socket.message({
+    type: 'response',
+    requestId: request.requestId,
+    ok: false,
+    message: 'earlier failed',
+  });
+  await rejected;
+  client.retryHistory(session.id);
+  await Promise.resolve();
+  assert.equal(socket.sent.at(-1).type, 'session.history');
+  assert.equal(socket.sent.at(-1).beforeSequence, 50);
+  snapshot(session, [event(session.id, 1)], { mode: 'prepend' });
+  await Promise.resolve();
+  assert.equal(client.state.history[session.id].error, undefined);
+  assert.equal(client.state.history[session.id].lastSequence, 50);
+});
+
+test('an old failure cannot overwrite a new history retry', async (t) => {
+  const { client, socket, sessions } = fixture(t);
+  const session = sessions[0];
+  client.select(session.id);
+  const request = socket.sent.at(-1);
+  socket.message({
+    type: 'response',
+    requestId: request.requestId,
+    ok: false,
+    message: 'old failure',
+  });
+  client.retryHistory(session.id);
+  await Promise.resolve();
+  assert.equal(client.state.history[session.id].loading, true);
+  assert.equal(client.state.history[session.id].error, undefined);
+});
+
+test('a fully received snapshot remains usable if its response frame is lost', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const { client, socket, sessions } = fixture(t);
+  const session = sessions[0];
+  client.select(session.id);
+  const request = socket.sent.at(-1);
+  socket.message({
+    type: 'session.snapshot',
+    requestId: request.requestId,
+    session,
+    mode: 'replace',
+    events: [event(session.id, 10)],
+    firstSequence: 10,
+    lastSequence: 10,
+    hasEarlier: false,
+  });
+  t.mock.timers.tick(30001);
+  await Promise.resolve();
+  assert.equal(client.state.history[session.id].needsReload, undefined);
+  assert.equal(client.state.history[session.id].error, undefined);
+  client.select(session.id);
+  assert.equal(socket.sent.at(-1).afterSequence, 10);
+});
+
+test('a tool without its result is not reported as completed when its run is inactive', () => {
+  const tool = {
+    kind: 'tool',
+    id: 'read',
+    runId: 'run',
+    name: 'Read',
+    input: '{"file_path":"picture.jpg"}',
+    target: 'Windows',
+    resolved: false,
+    state: 'running',
+    status: 'running',
+    at: new Date().toISOString(),
+  };
+  assert.equal(describe(tool, false).verb, '等待同步结果');
+  assert.equal(describe(tool, false).running, false);
+  assert.equal(describe(tool, true).running, true);
+  assert.equal(describe({ ...tool, state: 'completed', endedAt: tool.at }, false).verb, '已读取');
+});
+
 test('switching cancels old history, ignores its late error and avoids duplicate subscriptions while loading', async (t) => {
   const { client, socket, sessions } = fixture(t);
   const [a, b] = sessions;

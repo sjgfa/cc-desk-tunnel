@@ -76,7 +76,10 @@ export function describe(tool: Tool, active: boolean) {
   const running = active && isRunning(tool);
   return {
     category,
-    verb: outcomes[tool.state] ?? words[category][running ? 0 : 1],
+    verb:
+      !active && !tool.endedAt && ['requested', 'running', 'approval'].includes(tool.state)
+        ? '等待同步结果'
+        : (outcomes[tool.state] ?? words[category][running ? 0 : 1]),
     subject,
     added,
     removed,
@@ -88,8 +91,13 @@ export function describe(tool: Tool, active: boolean) {
 // The folded line for a run of tool calls: what is happening now, or what was done.
 export function summarize(work: Work, active: boolean, latest: boolean) {
   const tools = work.items.filter((item): item is Tool => item.kind === 'tool');
-  const waiting = tools.find((tool) => tool.state === 'approval');
+  const waiting = active && tools.find((tool) => tool.state === 'approval');
   const running = active ? tools.filter(isRunning) : [];
+  const incomplete =
+    !active &&
+    tools.some(
+      (tool) => !tool.endedAt && ['requested', 'running', 'approval'].includes(tool.state),
+    );
   const started = work.items[0].at;
   const last = work.items.at(-1)!;
   const ended = running.length
@@ -103,6 +111,7 @@ export function summarize(work: Work, active: boolean, latest: boolean) {
   else if (running.length)
     label = `正在${[...new Set(running.map((tool) => words[categoryOf(tool)][2]))].slice(0, 2).join('、')}`;
   else if (!tools.length) label = active && latest ? '正在思考' : '思考';
+  else if (incomplete) label = '工具结果尚未同步完整';
   else {
     const counts = new Map<Category, number>();
     for (const tool of tools) counts.set(categoryOf(tool), (counts.get(categoryOf(tool)) ?? 0) + 1);
@@ -113,6 +122,7 @@ export function summarize(work: Work, active: boolean, latest: boolean) {
   return {
     label,
     waiting: !!waiting,
+    incomplete,
     running: running.length > 0 || (!tools.length && active && latest),
     started,
     ended,
