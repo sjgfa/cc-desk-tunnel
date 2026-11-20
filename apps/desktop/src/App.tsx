@@ -385,7 +385,8 @@ export function App({
     !connected ||
     busy ||
     !!history?.loading ||
-    !!history?.needsReload ||
+    (!!history?.needsReload && !(history.paused && state.listeningId === selected?.id)) ||
+    (!!history?.paused && state.listeningId !== selected?.id) ||
     selected?.activeRun?.surface === 'terminal' ||
     (!!selected?.activeRun && (!nativeMode || !ownsRun)) ||
     refreshing;
@@ -1784,6 +1785,7 @@ export function App({
               events={events}
               history={history}
               connected={connected}
+              listening={state.listeningId === selected?.id}
               native={nativeMode}
               ownsRun={ownsRun}
               clock={clock}
@@ -1965,7 +1967,7 @@ export function App({
                 send={(text) => {
                   void send(text);
                 }}
-                resume={stopped && !inputDisabled ? resume : undefined}
+                resume={stopped && !inputDisabled && !history?.needsReload ? resume : undefined}
                 compact={() => {
                   void compact();
                 }}

@@ -348,22 +348,100 @@ test('pausing history keeps cached events and does not cancel or replay a write'
   );
 });
 
-test('a paused read stays paused across selection and resumes only when requested', async (t) => {
-  const { client, socket, sessions } = fixture(t);
+test('a paused read reestablishes live delivery across selection without downloading history', async (t) => {
+  const { client, socket, sessions, snapshot } = fixture(t);
   const session = sessions[0];
+  client.select(session.id);
+  snapshot(session, [event(session.id, 10)]);
   client.select(session.id);
   client.pauseHistory(session.id);
   client.select(sessions[1].id);
   client.select(session.id);
-  assert.equal(
-    socket.sent.filter((item) => item.type === 'session.subscribe' && item.sessionId === session.id)
-      .length,
-    1,
-  );
+  const subscription = socket.sent.filter((item) => item.type === 'session.subscribe').at(-1);
+  assert.equal(subscription.afterSequence, 10);
+  assert.equal(socket.sent.at(-1).type, 'session.history.cancel');
+  assert.equal(socket.sent.at(-1).requestId, subscription.requestId);
+  assert.equal(client.state.listeningId, null);
+  socket.message({
+    type: 'response',
+    requestId: subscription.requestId,
+    ok: false,
+    code: 'history_cancelled',
+    message: 'cancelled',
+  });
+  assert.equal(client.state.listeningId, session.id);
   assert.equal(client.state.history[session.id].paused, true);
+  socket.message({ type: 'session.event', event: event(session.id, 20, 'new reply') });
+  await new Promise((resolve) => setTimeout(resolve, 40));
+  assert.equal(client.state.events[session.id].at(-1).payload.text, 'new reply');
   client.retryHistory(session.id);
   assert.equal(client.state.history[session.id].paused, undefined);
   assert.equal(socket.sent.at(-1).sessionId, session.id);
+  assert.equal(socket.sent.at(-1).afterSequence, 10);
+});
+
+test('a paused session reconnects its live stream, ignores old page fragments and never replays messages', async (t) => {
+  const { client, socket, sessions, snapshot } = fixture(t);
+  const session = sessions[0];
+  client.select(session.id);
+  snapshot(session, [event(session.id, 10)]);
+  client.select(session.id);
+  client.pauseHistory(session.id);
+  const write = client
+    .request({ type: 'message.send', sessionId: session.id, text: 'once' })
+    .catch((error) => error);
+  socket.close();
+  assert.equal(client.state.listeningId, null);
+  assert.ok((await write) instanceof RequestInterruptedError);
+  client.retryNow();
+  const next = client.socket;
+  next.message({
+    type: 'ready',
+    protocolVersion: PROTOCOL_VERSION,
+    version: '0.3.16',
+    connectionId: randomUUID(),
+    adapter: 'simulation',
+    sessions,
+  });
+  const subscription = next.sent.find((item) => item.type === 'session.subscribe');
+  assert.equal(subscription.afterSequence, 10);
+  assert.equal(next.sent.at(-1).type, 'session.history.cancel');
+  assert.equal(client.state.listeningId, null);
+  next.message({
+    type: 'session.history.part',
+    requestId: subscription.requestId,
+    sessionId: sessions[1].id,
+    data: '[',
+    last: false,
+  });
+  assert.equal(client.state.listeningId, null);
+  next.message({
+    type: 'session.history.part',
+    requestId: subscription.requestId,
+    sessionId: session.id,
+    data: '[',
+    last: false,
+  });
+  assert.equal(client.state.listeningId, session.id);
+  assert.equal(client.state.history[session.id].paused, true);
+  assert.equal(client.state.history[session.id].loading, false);
+  next.message({
+    type: 'session.history.part',
+    requestId: subscription.requestId,
+    sessionId: session.id,
+    data: 'malformed remainder',
+    last: true,
+  });
+  next.message({ type: 'session.event', event: event(session.id, 30, 'received after reconnect') });
+  await new Promise((resolve) => setTimeout(resolve, 40));
+  assert.equal(client.state.events[session.id].at(-1).payload.text, 'received after reconnect');
+  assert.equal(client.state.status, 'connected');
+  assert.equal(
+    next.sent.some((item) => item.type === 'message.send'),
+    false,
+  );
+  client.retryHistory(session.id);
+  assert.equal(next.sent.at(-1).afterSequence, 10);
 });
 
 test('retrying a failed earlier page fetches that page instead of clearing its error with a latest read', async (t) => {

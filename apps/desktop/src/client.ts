@@ -130,6 +130,8 @@ export type HistoryState = {
   retryEarlier?: boolean;
 };
 export type ClientState = {
+  // Acknowledged live subscription on this socket, independent of downloading its history.
+  listeningId: string | null;
   status: 'disconnected' | 'connecting' | 'connected' | 'reconnecting';
   connectionId: string | null;
   // The computer this client signed in as; a session's commands run on the one it is on.
@@ -178,6 +180,7 @@ export type ConnectedDevice = Extract<ServerMessage, { type: 'devices' }>['devic
 // was missed is read from the service's record; nothing is resent automatically.
 export class ProxyClient {
   state: ClientState = {
+    listeningId: null,
     status: 'disconnected',
     connectionId: null,
     device: null,
@@ -252,6 +255,7 @@ export class ProxyClient {
       sessionUpdated?: boolean;
       done?: Promise<Response>;
       command?: NewCommand;
+      liveOnly?: boolean;
     }
   >();
   // The history read before, kept on disk; and the sessions being shown from it while the service is asked.
@@ -448,6 +452,25 @@ export class ProxyClient {
       receive(message);
     };
     const receive = (message: ServerMessage) => {
+      if (message.type === 'session.history.part' || message.type === 'session.snapshot') {
+        const request = this.pending.get(message.requestId);
+        const receivedSessionId =
+          message.type === 'session.history.part' ? message.sessionId : message.session.id;
+        if (
+          request?.type === 'session.subscribe' &&
+          request.sessionId === this.state.selectedId &&
+          request.sessionId === receivedSessionId
+        ) {
+          if (this.state.listeningId !== request.sessionId)
+            this.update({ listeningId: request.sessionId! });
+          if (request.liveOnly) {
+            clearTimeout(request.timer);
+            this.pending.delete(message.requestId);
+            request.resolve({ type: 'response', requestId: message.requestId, ok: true });
+            return;
+          }
+        }
+      }
       if (message.type === 'session.history.part') {
         const request = this.pending.get(message.requestId);
         if (!request || request.sessionId !== message.sessionId) return;
@@ -521,6 +544,7 @@ export class ProxyClient {
           : null;
         this.update({
           status: 'connected',
+          listeningId: null,
           connectionId: message.connectionId,
           browser: message.browser ?? null,
           sessions: message.sessions,
@@ -542,6 +566,12 @@ export class ProxyClient {
         if (!request) return;
         clearTimeout(request.timer);
         this.pending.delete(message.requestId);
+        if (request.liveOnly && (message.ok || message.code === 'history_cancelled')) {
+          if (request.sessionId === this.state.selectedId)
+            this.update({ listeningId: request.sessionId! });
+          request.resolve({ ...message, ok: true });
+          return;
+        }
         if (message.ok) request.resolve(message);
         else {
           this.results.delete(message.requestId);
@@ -705,6 +735,7 @@ export class ProxyClient {
       clearTimeout(timeout);
       if (this.socket !== socket) return;
       this.socket = null;
+      this.update({ listeningId: null });
       if (credentials.browser && event.code === 4001) {
         this.credentials = null;
         credentials.browser();
@@ -761,7 +792,12 @@ export class ProxyClient {
     socket?.close();
     this.rejectPending();
     this.retryAttempt = 0;
-    this.update({ status: 'disconnected', connectionId: null, setupToken: null });
+    this.update({
+      status: 'disconnected',
+      connectionId: null,
+      listeningId: null,
+      setupToken: null,
+    });
   }
   private rejectPending() {
     for (const [requestId, request] of this.pending) {
@@ -1008,7 +1044,10 @@ export class ProxyClient {
   }
   // A session not in memory shows what is kept of it at once; the service is then asked for what came since.
   private present(sessionId: string) {
-    if (this.state.history[sessionId]?.paused) return;
+    if (this.state.history[sessionId]?.paused) {
+      this.listen(sessionId);
+      return;
+    }
     if (this.state.history[sessionId] || !this.disk.ready) {
       if (this.state.status === 'connected') this.load(sessionId);
       return;
@@ -1082,7 +1121,7 @@ export class ProxyClient {
     if (!result) throw new Error('服务没有返回数据。');
     return result as Extract<ServerMessage, { type: Replies[T] }>;
   }
-  async request(command: NewCommand): Promise<Response> {
+  async request(command: NewCommand, liveOnly = false): Promise<Response> {
     if (this.state.status !== 'connected' || this.socket?.readyState !== WebSocket.OPEN)
       throw new Error('服务未连接。');
     const requestId = crypto.randomUUID();
@@ -1114,6 +1153,7 @@ export class ProxyClient {
         timer: setTimeout(expire, wait),
         type: command.type,
         command,
+        liveOnly,
         sessionId: history ? command.sessionId : undefined,
         renew: () => {
           clearTimeout(request.timer);
@@ -1121,7 +1161,13 @@ export class ProxyClient {
         },
       };
       this.pending.set(requestId, request);
+      if (command.type === 'session.subscribe' && this.state.listeningId !== command.sessionId)
+        this.update({ listeningId: null });
       this.socket!.send(JSON.stringify({ ...command, requestId }));
+      // Protocol 27 registers the subscription before delivering history. Cancel only that read;
+      // its cancellation reply (or first page fragment) acknowledges that live events can arrive.
+      if (liveOnly)
+        this.socket!.send(JSON.stringify({ type: 'session.history.cancel', requestId }));
     });
     this.pending.get(requestId)!.done = done;
     return done;
@@ -1154,10 +1200,59 @@ export class ProxyClient {
             needsReload: history.needsReload || history.loading,
             paused: true,
             retryEarlier: earlier || history.retryEarlier,
-            error: '历史同步已暂停；记录仍保存在服务端。',
+            error: '历史同步已暂停；可发送新消息，旧记录稍后同步。',
           },
         },
       });
+    this.listen(sessionId);
+  }
+  private listen(sessionId: string) {
+    if (
+      this.state.status !== 'connected' ||
+      this.state.selectedId !== sessionId ||
+      this.state.listeningId === sessionId
+    )
+      return;
+    if (
+      [...this.pending.values()].some(
+        (request) => request.liveOnly && request.sessionId === sessionId,
+      )
+    )
+      return;
+    const history = this.state.history[sessionId];
+    if (!history?.paused) return;
+    const afterSequence = history.needsReload ? (history.resumeAfter ?? 0) : history.lastSequence;
+    this.update({
+      history: {
+        ...this.state.history,
+        [sessionId]: { ...history, needsReload: true, resumeAfter: afterSequence },
+      },
+    });
+    const last = this.state.events[sessionId]?.find((event) => event.sequence === afterSequence);
+    void this.request(
+      {
+        type: 'session.subscribe',
+        sessionId,
+        afterSequence,
+        ...(last ? { afterCreatedAt: last.createdAt } : {}),
+      },
+      true,
+    ).catch((error: Error) => {
+      if (
+        error.name === 'AbortError' ||
+        this.state.selectedId !== sessionId ||
+        this.state.listeningId === sessionId
+      )
+        return;
+      const current = this.state.history[sessionId];
+      if (current?.paused)
+        this.update({
+          history: {
+            ...this.state.history,
+            [sessionId]: { ...current, error: `实时连接尚未就绪：${error.message}` },
+          },
+        });
+    });
   }
   retryHistory(sessionId: string) {
     if (this.state.status !== 'connected' || this.state.selectedId !== sessionId) return;

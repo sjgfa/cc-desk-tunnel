@@ -38,6 +38,27 @@ test('stale tools stop spinning, stalled history can pause and retry without res
       target: 'Windows',
     }),
   ];
+  const liveRun = randomUUID();
+  const liveEvents = [
+    {
+      ...event(6, {
+        type: 'message.user',
+        messageId: randomUUID(),
+        text: '无需历史，开始新任务',
+        scenario: 'chat',
+      }),
+      runId: liveRun,
+    },
+    {
+      ...event(7, {
+        type: 'text.delta',
+        messageId: randomUUID(),
+        text: '这是暂停同步后的新回复。',
+      }),
+      runId: liveRun,
+    },
+    { ...event(8, { type: 'run.status', status: 'completed', connectionId }), runId: liveRun },
+  ];
   let send: (value: unknown) => void = () => {};
   const requests: {
     type: string;
@@ -103,6 +124,14 @@ test('stale tools stop spinning, stalled history can pause and retry without res
           events: cached,
         });
       }
+      if (command.type === 'message.send') {
+        send({
+          type: 'session.updated',
+          session: { ...session, activeRun: { id: liveRun, status: 'running', connectionId } },
+        });
+        for (const event of liveEvents) send({ type: 'session.event', event });
+        send({ type: 'session.updated', session: stopped });
+      }
       send({ type: 'response', requestId: command.requestId, ok: true });
     });
   });
@@ -126,7 +155,12 @@ test('stale tools stop spinning, stalled history can pause and retry without res
   await page.screenshot({ path: resolve(screenshots, 'history-recovery-syncing.png') });
   await page.getByRole('button', { name: '暂停历史同步', exact: true }).click();
   await expect(banner).toContainText('已暂停');
-  await expect(page.getByRole('textbox', { name: '消息', exact: true })).toBeDisabled();
+  await expect(page.getByRole('textbox', { name: '消息', exact: true })).toBeEnabled();
+  await page.getByRole('textbox', { name: '消息', exact: true }).fill('无需历史，开始新任务');
+  await page.getByRole('button', { name: '发送消息', exact: true }).click();
+  await expect(page.getByText('这是暂停同步后的新回复。', { exact: true })).toBeVisible();
+  await expect(banner).toContainText('旧记录稍后同步');
+  await page.screenshot({ path: resolve(screenshots, 'history-paused-new-reply.png') });
   await page.getByRole('button', { name: '重试历史同步', exact: true }).click();
   await expect.poll(() => subscriptions).toBe(3);
   const retry = requests.filter((request) => request.type === 'session.subscribe').at(-1)!;
@@ -149,7 +183,7 @@ test('stale tools stop spinning, stalled history can pause and retry without res
       session: stopped,
       mode: 'append',
       firstSequence: 3,
-      lastSequence: 5,
+      lastSequence: 8,
       hasEarlier: false,
       events: [
         event(3, {
@@ -161,6 +195,7 @@ test('stale tools stop spinning, stalled history can pause and retry without res
         }),
         event(4, { type: 'text.delta', messageId: randomUUID(), text: '图片已经检查完成。' }),
         event(5, { type: 'run.status', status: 'completed', connectionId }),
+        ...liveEvents,
       ],
     },
   ]);
@@ -175,7 +210,9 @@ test('stale tools stop spinning, stalled history can pause and retry without res
   await expect(banner).toHaveCount(0);
   await expect(page.getByText('图片已经检查完成。', { exact: true })).toBeVisible();
   await expect(page.getByRole('textbox', { name: '消息', exact: true })).toBeEnabled();
-  expect(
-    requests.filter((request) => ['message.send', 'run.cancel', 'leave'].includes(request.type)),
-  ).toHaveLength(0);
+  expect(requests.filter((request) => ['run.cancel', 'leave'].includes(request.type))).toHaveLength(
+    0,
+  );
+  expect(requests.filter((request) => request.type === 'message.send')).toHaveLength(1);
+  await expect(page.getByText('这是暂停同步后的新回复。', { exact: true })).toHaveCount(1);
 });

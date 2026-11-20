@@ -718,6 +718,7 @@ export default function Conversation({
   events,
   history,
   connected,
+  listening,
   native,
   ownsRun,
   clock,
@@ -741,6 +742,7 @@ export default function Conversation({
   events: SessionEvent[];
   history: HistoryState | undefined;
   connected: boolean;
+  listening: boolean;
   native: boolean;
   ownsRun: boolean;
   busy: boolean;
@@ -1347,9 +1349,18 @@ export default function Conversation({
               <span>
                 {history.loading || history.loadingEarlier
                   ? `正在同步${history.loadingEarlier ? '早期' : ''}记录 · 已接收 ${history.receivedParts ?? 0} 段`
-                  : history.error || '历史尚未同步完整，请重试。'}
+                  : history.paused &&
+                      connected &&
+                      !listening &&
+                      !history.error?.startsWith('实时连接')
+                    ? '历史已暂停，正在恢复实时消息连接。'
+                    : history.error || '历史尚未同步完整，请重试。'}
               </span>
-              <small>旧记录中的未完成工具不代表仍在执行；无需重发原任务。</small>
+              <small>
+                {history.paused
+                  ? '上下文保留在服务端。旧记录及断线期间的消息可能缺失，请勿重发原任务。'
+                  : '旧记录中的未完成工具不代表仍在执行；无需重发原任务。'}
+              </small>
             </div>
             {history.loading || history.loadingEarlier ? (
               <button type="button" className="button" onClick={pauseHistory}>

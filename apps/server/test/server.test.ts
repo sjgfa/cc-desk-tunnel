@@ -103,6 +103,49 @@ async function fixture(t: TestContext, stepMs = 2, graceMs?: number) {
   return { directory, server, url, clients, connect, create };
 }
 
+test('cancelling only history keeps live message delivery, including on a new connection', async (t) => {
+  const f = await fixture(t);
+  const first = await f.connect();
+  const sessionId = await f.create(first);
+  f.server.store.append(sessionId, randomUUID(), {
+    type: 'text.delta',
+    messageId: randomUUID(),
+    text: 'history '.repeat(70000),
+  });
+  for (const [index, client] of [first, await f.connect()].entries()) {
+    const requestId = randomUUID();
+    client.send({ type: 'session.subscribe', sessionId, requestId, afterSequence: 0 });
+    client.send({ type: 'session.history.cancel', requestId });
+    const cancelled = await client.wait((m) => m.type === 'response' && m.requestId === requestId);
+    assert.ok(
+      cancelled.type === 'response' && (cancelled.ok || cancelled.code === 'history_cancelled'),
+    );
+    if (index === 0)
+      assert.ok(cancelled.type === 'response' && cancelled.code === 'history_cancelled');
+    const text = `new message ${index}`;
+    const response = await client.request({
+      type: 'message.send',
+      sessionId,
+      text,
+      scenario: 'chat',
+    });
+    assert.ok(response.type === 'response' && response.ok);
+    await client.wait((m) => m.type === 'session.event' && m.event.payload.type === 'text.delta');
+    await client.wait(
+      (m) =>
+        m.type === 'session.event' &&
+        m.event.payload.type === 'run.status' &&
+        m.event.payload.status === 'completed',
+    );
+    assert.equal(
+      f.server.store
+        .snapshot(sessionId)
+        .events.filter((e) => e.payload.type === 'message.user' && e.payload.text === text).length,
+      1,
+    );
+  }
+});
+
 test('requires authentication, rejects wrong token/version/origin and accepts health', async (t) => {
   const f = await fixture(t);
   assert.deepEqual(await (await fetch(f.url + '/health')).json(), {
