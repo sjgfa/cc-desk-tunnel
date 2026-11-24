@@ -399,9 +399,10 @@ test('a paused session reconnects its live stream, ignores old page fragments an
   next.message({
     type: 'ready',
     protocolVersion: PROTOCOL_VERSION,
-    version: '0.3.16',
+    version: '0.3.19',
     connectionId: randomUUID(),
     adapter: 'simulation',
+    projects: [],
     sessions,
   });
   const subscription = next.sent.find((item) => item.type === 'session.subscribe');
