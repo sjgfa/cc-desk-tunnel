@@ -5,6 +5,7 @@ import { randomUUID } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
 import {
   connectionArgs,
+  signInWindow,
   connectionDirectory,
   createSession,
   login,
@@ -12,6 +13,29 @@ import {
   settled,
   screenshots,
 } from './helpers.ts';
+
+test.describe('on a touch screen', () => {
+  test.use({ hasTouch: true, isMobile: true });
+
+  test('a long press keeps the system selection and copy menu', async ({ page }) => {
+    await page.goto('/');
+    await login(page);
+    await createSession(page, '长按复制');
+    await send(page, '长按这一段文字');
+    await settled(page);
+    const text = page.locator('.message.user .message-content p');
+    await text.tap();
+    expect(
+      await text.evaluate(
+        (element) =>
+          !element.dispatchEvent(
+            new MouseEvent('contextmenu', { bubbles: true, cancelable: true }),
+          ),
+      ),
+    ).toBe(false);
+    await expect(page.getByRole('menu', { name: '对话文字操作' })).toHaveCount(0);
+  });
+});
 
 test('message dates, selection menu, code copy and conversation find work together', async ({
   page,
@@ -44,7 +68,7 @@ test('message dates, selection menu, code copy and conversation find work togeth
     return { x: box.x + 5, y: box.y + box.height / 2 };
   });
   await page.mouse.click(selectionPoint.x, selectionPoint.y, { button: 'right' });
-  await page.getByRole('menuitem', { name: '复制选中文字', exact: true }).click();
+  await page.getByRole('menuitem', { name: '复制', exact: true }).click();
   expect(await page.evaluate(() => (window as unknown as { copied: string }).copied)).toBe(
     '阅读唯一词',
   );
@@ -204,15 +228,6 @@ test('Electron copies text and supplies the native editing context menu', async 
       BrowserWindow.getAllWindows()[0].webContents.paste(),
     );
     await expect(input).toHaveValue('复制粘贴测试');
-    // A picture that is only on the clipboard is saved in the profile, and only a picture is.
-    const saved = await page.evaluate(() =>
-      window.desktop!.saveImage('image/png', new Uint8Array([137, 80, 78, 71])),
-    );
-    expect(saved.startsWith(resolve(connectionDirectory(profile), 'pasted'))).toBe(true);
-    expect(readFileSync(saved)).toEqual(Buffer.from([137, 80, 78, 71]));
-    await expect(
-      page.evaluate(() => window.desktop!.saveImage('text/plain', new Uint8Array([1]))),
-    ).rejects.toThrow(/图片/);
     const roles = await application.evaluate(({ BrowserWindow, Menu }) => {
       const build = Menu.buildFromTemplate;
       let items: unknown[] = [];
@@ -246,6 +261,20 @@ test('Electron copies text and supplies the native editing context menu', async 
         expect.objectContaining({ role: 'paste', enabled: true }),
       ]),
     );
+    // A picture that is only on the clipboard is saved with the connection, and only a picture is; the sign-in
+    // window, no connection's yet, keeps none.
+    await expect(
+      page.evaluate(() => window.desktop!.saveImage('image/png', new Uint8Array([137]))),
+    ).rejects.toThrow(/登录/);
+    const signedIn = await signInWindow(application);
+    const saved = await signedIn.evaluate(() =>
+      window.desktop!.saveImage('image/png', new Uint8Array([137, 80, 78, 71])),
+    );
+    expect(saved.startsWith(resolve(connectionDirectory(profile), 'pasted'))).toBe(true);
+    expect(readFileSync(saved)).toEqual(Buffer.from([137, 80, 78, 71]));
+    await expect(
+      signedIn.evaluate(() => window.desktop!.saveImage('text/plain', new Uint8Array([1]))),
+    ).rejects.toThrow(/图片/);
   } finally {
     await application.evaluate(({ clipboard }, text) => clipboard.writeText(text), previous);
     await application.close();

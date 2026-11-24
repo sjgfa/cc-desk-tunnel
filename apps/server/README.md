@@ -42,11 +42,12 @@ Linux 上的代理服务：认证客户端、管理会话、驱动官方 Claude 
 
 当前个人自用，多会话，同一使用者的几台设备可以同时在线，各有各的执行通道。会话记着它所在的设备（`device`），它的运行和终端都在那台设备上执行；任何设备都可以向它发消息、答复审批、停止运行或打开终端，前提是那台设备在线且执行通道就绪。服务端把在线设备的列表（`devices`）推给所有连接。要换到另一台设备上做，用 `session.move` 给出本机的项目目录把它接过来，或用带 `projectPath` 的 `session.fork` 分叉到本机。升级前没有设备信息的会话归第一个使用它的设备。设备标识在登录之后由单独的 `device` 帧给出，登录帧保持各版本都能读的形状。运行和终端合计有上限，默认按“（内存 − 300 MB）÷ 300 MB”取整，至少 1，可用 `PROXY_MAX_RUNS` 指定。运行属于会话所在的设备而不是某条连接：设备断线后运行继续，设备的命令经它固定的本机入口（`devices/<设备>/`，密钥随每次连接更换）等待它连回来，离线超过宽限期（默认 5 分钟，`PROXY_GRACE_SECONDS`）才停止。停止或断连不会静默重放；未确认的工具结果标记 unknown。SSH 终止不保证远端子进程全部结束。
 
-浏览器只有控制连接，不注册设备或执行通道。启用 Web 后，它可新建归属稳定「服务端」设备的普通会话，直接在容器工作目录里运行 Claude，不使用 Windows SSH 提示词或执行通道。桌面也可操作这些会话；退出浏览器或关闭 Web 不停止已有模型运行，浏览器终端仍随连接结束。服务端普通会话各有独立目录；项目目录分配与记忆共享沿用主线 `native_roots`，不另建浏览器项目模型。
+浏览器只有控制连接，不注册设备或执行通道。启用 Web 后，它可新建归属稳定「服务端」设备的普通会话，直接在容器工作目录里运行 Claude，不使用 Windows SSH 提示词或执行通道。桌面也可操作这些会话；退出浏览器或关闭 Web 不停止已有模型运行，浏览器终端仍随连接结束。服务端普通会话各有独立目录；项目目录分配与记忆共享沿用主线 `native_roots`；浏览器按服务端登记的项目分组显示各电脑的会话，不在浏览器里管理项目。
 
 ## 实现与验证
 
 - 模块：`main.ts` / `config.ts` 读环境并启动；`server.ts` 是连接与命令的唯一入口；`store.ts` 持久化；`claude.ts`（SDK 运行）、`claude-stream.ts`（原生消息转协议事件）、`native-input.ts`（运行中追加输入）、`native-controls.ts`（账号 / 模型 / 额度）、`native-terminal.ts`、`native-account.ts`、`login-expiry.ts`（登录到期提醒）、`native-onboarding.ts` 组成原生适配；`tunnel.ts` 管执行通道与 SSH 配置；`usage.ts` 收集调用统计；`simulation.ts` 是离线模拟；`errors.ts` 是可回给客户端的错误。
+- `src/files.ts`、`src/landlock-run.py`：文件面板的服务端。一条文件连接（首帧 `files.attach`）交给 ssh2 的 SSH 服务端，SFTP 子系统按环境变量 `CC_DESK_TUNNEL_FILES` 接到容器自己的 `sftp-server`（镜像装 `openssh-sftp-server`），或经设备入口的配置运行 `ssh -s device sftp`。Linux 上先用 `landlock-run.py --probe` 试内核的 Landlock，可用时 `sftp-server` 经这个启动器运行，受保护的路径见[部署与安全边界](../../docs/deployment.md)。连接或通道结束时结束子进程。Windows 开发时用 Git for Windows 带的 `sftp-server`（Windows 自带的那个不能接在管道上）。
 - `src/server.ts`：认证、请求、连接归属和广播；每类命令一个处理函数，`execute` 只做分发。模拟器在 `src/simulation.ts`。三种场景为聊天、一次 PowerShell 审批、上游错误。PowerShell 仅显示固定 `Get-Location` 和模拟结果，从不创建命令进程。
 - `src/store.ts`：Node 24 内置 SQLite / WAL，摘要与原始事件分表、每事件事务落盘，不逐 token 重写整份历史。旧 UTF-8 JSON 一次性事务导入、原文件保留作迁移备份；日后备份以 SQLite 和原生 CLI 存储为准。启动恢复未结束轮次，不重放。
 - 状态读取不改变会话的最近使用时间。升级时修正旧的活动时间和用量周期边界，原始事件与调用记录保留。提前重置的时间靠额度读数推断，历史读数缺失时不能精确恢复。

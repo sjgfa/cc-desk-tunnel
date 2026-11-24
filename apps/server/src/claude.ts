@@ -2,7 +2,13 @@ import { mkdirSync, existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { delimiter, join } from 'node:path';
 import { query, getSessionInfo } from '@anthropic-ai/claude-agent-sdk';
 import type { Query, SDKSessionInfo, SDKUserMessage } from '@anthropic-ai/claude-agent-sdk';
-import type { Effort, EventPayload, NativeMetrics, PermissionMode } from '@cc-desk-tunnel/protocol';
+import type {
+  Effort,
+  EventPayload,
+  NativeMetrics,
+  PermissionMode,
+  PlanMode,
+} from '@cc-desk-tunnel/protocol';
 import { deviceTerms } from './device-terms.ts';
 import type { Execution } from './device-terms.ts';
 import { ClaudeStream } from './claude-stream.ts';
@@ -25,12 +31,13 @@ export function nativeContext(sessionId: string, info: SDKSessionInfo | undefine
   } satisfies EventPayload;
 }
 
-// Whether reasoning summaries are asked for. A settings file that cannot be read leaves them on.
+// Whether reasoning summaries are asked for: only when the setting is on, as in the interactive CLI, whose
+// default is off. A settings file that cannot be read leaves them off.
 function thinkingShown() {
   try {
-    return readNativeSettings().showThinkingSummaries !== false;
+    return readNativeSettings().showThinkingSummaries === true;
   } catch {
-    return true;
+    return false;
   }
 }
 
@@ -59,11 +66,17 @@ export type ClaudeRun = {
   signal: AbortSignal;
   emit: (event: EventPayload) => void;
   // Asks the user about a tool call. A question Claude asks comes back with the answers chosen, or with how it went
-  // unanswered.
+  // unanswered; Claude's plan with how the user decided on it.
   approve: (
     toolId: string,
-    waiting: 'approval' | 'question',
-  ) => Promise<{ allowed: boolean; answers?: Record<string, string>; unanswered?: Unanswered }>;
+    waiting: 'approval' | 'question' | 'plan',
+    why?: { reason?: string; safetyCheck?: boolean },
+  ) => Promise<{
+    allowed: boolean;
+    answers?: Record<string, string>;
+    unanswered?: Unanswered;
+    plan?: PlanDecision;
+  }>;
   // Absent only for a session owned by the service itself.
   ssh?: SshConnection;
   // Told when Claude has finished its turn and the run goes on only for background tasks, and when it resumes.
@@ -97,6 +110,38 @@ const UNANSWERED: Record<Unanswered, string> = {
 };
 // A CLI that takes an answer saying how a question went unanswered.
 const UNANSWERED_CAPABILITY = 'ask_user_question_unanswered_v1';
+// How the user decided on Claude's plan: approved in a mode, as written or as changed; or sent back to plan further.
+export type PlanDecision = { mode?: PlanMode; edited?: string; feedback?: string };
+// What Claude reads of a plan sent back.
+export function keepPlanning(feedback?: string) {
+  return feedback?.trim()
+    ? `The user has not approved the plan and wants you to keep planning. Their feedback:\n${feedback.trim()}`
+    : 'The user has not approved the plan and wants you to keep planning.';
+}
+// A plan approved: the CLI carries it out in the mode chosen (Claude Code's own plan approval sets it the same
+// way), and with the plan as the user changed it, which it writes back to the plan file and tells Claude of. The
+// input shown is the plan carried out.
+export function approvedPlan(
+  mapper: Pick<ClaudeStream, 'tool'>,
+  name: string,
+  input: Record<string, unknown>,
+  id: string,
+  plan?: PlanDecision,
+) {
+  const updatedInput = plan?.edited ? { ...input, plan: plan.edited } : input;
+  if (plan?.edited) mapper.tool(name, updatedInput, id);
+  return {
+    behavior: 'allow' as const,
+    updatedInput,
+    ...(plan?.mode
+      ? {
+          updatedPermissions: [
+            { type: 'setMode' as const, mode: plan.mode, destination: 'session' as const },
+          ],
+        }
+      : {}),
+  };
+}
 // How long a CLI whose input has ended is given to exit by itself.
 const EXIT_MS = 5000;
 const loginExpiry = loginExpiryWarnings();
@@ -123,6 +168,7 @@ export function remotePrompt(projectPath: string, sessionId: string, execution: 
     "Do all project reads, edits, searches and commands on the device with your native Bash tool over SSH: here ssh, scp and sftp know the device by the host names below, and reach any other host as they otherwise would. Do not use this host's Read/Edit tools on project files, and do not read or copy the keys these hosts sign in with.",
     terms.script,
     terms.command,
+    "device always means this session's own computer. Only when the user refers to another of their computers, run devices: it lists those online, each with host names used as device's are, the one ending in a shell's name taking a script in that shell. Do there only what the user asked, and confirm before changing anything.",
     'If the device is unreachable, say so; never fall back to this host. After an interruption report results as unknown; do not repeat side effects on your own.',
     'To look at a picture on the device, such as a pasted screenshot or an attached image, copy that one file with scp to a temporary file on this host, open it with the Read tool, and delete the copy afterwards. That is the only use of Read on this host for a file from the device.',
     'Commands may run concurrently. One that blocks holds the turn until its Bash timeout: size the timeout to the work, and run anything long-lived, such as a dev server or watcher, as a background Bash task. Do not count on a process outliving the ssh command that started it, nor on ending the command to stop it: keep the command running for as long as the process is needed, and stop the process itself on the device.',
@@ -149,6 +195,18 @@ export function prepareNativeDirectory(options: ClaudeOptions, dataDir: string, 
   settings.cleanupPeriodDays = options.contextRetentionDays ?? 3650;
   writeFileSync(localSettingsPath, JSON.stringify(settings, null, 2) + '\n', { mode: 0o600 });
   return cwd;
+}
+
+// Why the CLI asks about a call: its reason, and whether one of its own safety checks asks. Bypassing permissions
+// it asks about nothing else, so every ask then is one; otherwise the kind of reason says so, though a compound
+// command's ask comes as its subcommands' results (the SDK passes the kind without typing it).
+function asked(context: { decisionReason?: string }, mode: string | undefined) {
+  const kind = (context as { decisionReasonType?: unknown }).decisionReasonType;
+  const reason = context.decisionReason?.trim().slice(0, 4000);
+  return {
+    ...(reason ? { reason } : {}),
+    ...(kind === 'safetyCheck' || mode === 'bypassPermissions' ? { safetyCheck: true } : {}),
+  };
 }
 
 export async function runClaude(
@@ -235,10 +293,18 @@ export async function runClaude(
         canUseTool: async (name, input, context) => {
           const tool = mapper.tool(name, input, context.toolUseID);
           const question = name === 'AskUserQuestion';
-          const { allowed, answers, unanswered } =
+          // Claude asks to carry out the plan it wrote; the CLI has put the plan in the input.
+          const planned = name === 'ExitPlanMode';
+          const { allowed, answers, unanswered, plan } =
             context.signal.aborted || run.signal.aborted
               ? { allowed: false }
-              : await run.approve(tool.id, question ? 'question' : 'approval');
+              : await run.approve(
+                  tool.id,
+                  question ? 'question' : planned ? 'plan' : 'approval',
+                  question || planned
+                    ? undefined
+                    : asked(context, mapper.mode ?? run.permissionMode),
+                );
           if (question && unanswered) {
             // A CLI that knows of it is told how the question went: the tool's result says so, and Claude reads
             // the answer given for each question. An older one refuses an answer that says it.
@@ -265,8 +331,11 @@ export async function runClaude(
               behavior: 'deny',
               message: question
                 ? 'The user declined to answer.'
-                : 'The user denied or cancelled this request.',
+                : planned
+                  ? keepPlanning(plan?.feedback)
+                  : 'The user denied or cancelled this request.',
             };
+          if (planned) return approvedPlan(mapper, name, input, context.toolUseID, plan);
           // The official tool takes the user's choices as `answers`, keyed by question text.
           return {
             behavior: 'allow',

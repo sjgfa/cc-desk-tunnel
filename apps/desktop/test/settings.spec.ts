@@ -45,6 +45,7 @@ test('Claude Code settings load from the service and save each change at once', 
           version: '0.0.1',
           connectionId: randomUUID(),
           adapter: 'claude-code',
+          projects: [],
           sessions: [],
         });
         return;
@@ -71,7 +72,21 @@ test('Claude Code settings load from the service and save each change at once', 
     .getByRole('button', { name: 'CLI 设置', exact: true })
     .click();
   const panel = page.getByRole('region', { name: 'CLI 设置' });
+  await expect(
+    panel.getByLabel('自动压缩上下文', { exact: true }).locator('option[value=""]'),
+  ).toHaveText('默认（开启）');
+  await expect(
+    panel.getByLabel('快速模式', { exact: true }).locator('option[value=""]'),
+  ).toHaveText('默认（关闭）');
+  await expect(
+    panel.getByLabel('工具搜索', { exact: true }).locator('option[value=""]'),
+  ).toHaveText('默认（自动）');
   await expect(panel.getByLabel('自动压缩窗口', { exact: true })).toHaveValue('250000');
+  // A setting that takes more words than its line has a "?" to the part of the help on it.
+  await panel.getByRole('button', { name: '快速模式：说明', exact: true }).click();
+  await expect(page.locator('.help-article-head h1')).toHaveText('思考、速度与备用模型');
+  await expect(page.locator('#help-fast')).toBeInViewport();
+  await page.getByRole('button', { name: '后退', exact: true }).click();
   await expect(panel.getByLabel('快速模式', { exact: true })).toHaveValue('false');
   await panel.getByLabel('自动压缩窗口', { exact: true }).selectOption('1000000');
   await panel.getByLabel('额度用尽后自动继续', { exact: true }).selectOption('true');
@@ -135,6 +150,7 @@ test('the global CLAUDE.md is edited here and saved only over what was read', as
           version: '0.0.1',
           connectionId: randomUUID(),
           adapter: 'claude-code',
+          projects: [],
           sessions: [],
         });
         return;

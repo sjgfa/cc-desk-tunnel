@@ -8,6 +8,7 @@ import { PROTOCOL_VERSION } from '@cc-desk-tunnel/protocol';
 import type { Session } from '@cc-desk-tunnel/protocol';
 import {
   connectionArgs,
+  signInWindow,
   createSession,
   expandActivity,
   login,
@@ -37,7 +38,7 @@ test('a menu longer than the window scrolls inside it', async ({ page }) => {
   expect(box.y).toBeGreaterThanOrEqual(0);
   expect(box.y + box.height).toBeLessThanOrEqual(420);
   expect(await menu.evaluate((node) => node.scrollHeight > node.clientHeight)).toBe(true);
-  const last = page.getByRole('menuitem', { name: '选择其他文件夹…', exact: true });
+  const last = page.getByRole('menuitem', { name: '其他文件夹…', exact: true });
   await last.scrollIntoViewIfNeeded();
   await expect(last).toBeInViewport();
 });
@@ -60,7 +61,6 @@ test('pages, side column, menus, pins, export, settings and the notice list', as
   await expect(page.locator('.list-heading').first()).toHaveText('置顶');
   await page.getByRole('button', { name: `项目操作 · ${project}`, exact: true }).click();
   await shot(page, '02-项目菜单');
-  await expect(page.getByRole('menuitem', { name: '移除项目' })).toHaveCount(0);
   await page.getByRole('menuitem', { name: '修改显示名称', exact: true }).click();
   await page.getByRole('dialog').getByLabel('显示名称').fill('我的项目');
   await page.getByRole('dialog').getByRole('button', { name: '保存', exact: true }).click();
@@ -70,13 +70,26 @@ test('pages, side column, menus, pins, export, settings and the notice list', as
   await group.click({ button: 'right' });
   await page.getByRole('menuitem', { name: '置顶', exact: true }).click();
   await expect(group.locator('.pin-mark')).toBeVisible();
+  // Removed, the project leaves the list and its session is a plain one where it is; the folder added again, the
+  // session is back in it, under the folder's own name.
+  await group.click({ button: 'right' });
+  await page.getByRole('menuitem', { name: '移除项目', exact: true }).click();
+  await expect(page.locator('.project-group > h2').filter({ hasText: '我的项目' })).toHaveCount(0);
+  await expect(page.locator('.composer-context')).toContainText('普通会话');
+  await page.getByRole('button', { name: '添加项目', exact: true }).click();
+  await page.getByLabel('本机项目目录').fill(project);
+  await page.getByRole('button', { name: '添加', exact: true }).click();
+  await expect(
+    page.locator(`.project-group > h2[title="${project.replaceAll('\\', '\\\\')}"]`),
+  ).toHaveCount(1);
+  await expect(page.locator('.composer-context')).toContainText('中文项目');
 
   // The whole session leaves as one Markdown file.
   await row.hover();
   await row.getByRole('button', { name: '会话操作', exact: true }).click();
   await shot(page, '03-会话菜单');
   const download = page.waitForEvent('download');
-  await page.getByRole('menuitem', { name: '导出为 Markdown', exact: true }).click();
+  await page.getByRole('menuitem', { name: '导出 Markdown', exact: true }).click();
   const file = await download;
   expect(file.suggestedFilename()).toBe(`${title}.md`);
   const text = readFileSync(await file.path(), 'utf8');
@@ -118,7 +131,6 @@ test('pages, side column, menus, pins, export, settings and the notice list', as
     ['账号与额度', '账号与额度'],
     ['CLI 设置', 'CLI 设置'],
     ['全局说明', '全局说明'],
-    ['帮助', '帮助'],
     ['关于与更新', '关于与更新'],
   ]) {
     await sections.getByRole('button', { name, exact: true }).click();
@@ -291,7 +303,7 @@ test('a question is answered with its choices, and a session or a whole project 
   const row = page.locator('.session-row.selected');
   await row.hover();
   await row.getByRole('button', { name: '会话操作', exact: true }).click();
-  await page.getByRole('menuitem', { name: '移到其他项目…', exact: true }).click();
+  await page.getByRole('menuitem', { name: '移到项目…', exact: true }).click();
   await expect(page.getByRole('menu', { name: '会话所在的项目', exact: true })).toBeVisible();
   await page.getByRole('menuitemradio', { name: '另一个项目', exact: true }).click();
   await expect(chip).toContainText('另一个项目');
@@ -301,7 +313,7 @@ test('a question is answered with its choices, and a session or a whole project 
   // A folder that is no project yet is chosen in the same menu, and becomes one.
   await chip.click();
   page.once('dialog', (dialog) => void dialog.accept('F:\\全新\\没加过的文件夹'));
-  await page.getByRole('menuitem', { name: '选择其他文件夹…', exact: true }).click();
+  await page.getByRole('menuitem', { name: '其他文件夹…', exact: true }).click();
   await expect(chip).toContainText('没加过的文件夹');
   await expect(page.locator('.project-group').filter({ hasText: '没加过的文件夹' })).toHaveCount(1);
   await chip.click();
@@ -374,6 +386,7 @@ test('a run that goes on only for background tasks looks finished, lists them an
           version: '0.0.1',
           connectionId,
           adapter: 'claude-code',
+          projects: [],
           sessions: [session],
         });
         return;
@@ -474,6 +487,7 @@ test('approval modes are described where they are chosen, and models sit behind 
           version: '0.0.1',
           connectionId: randomUUID(),
           adapter: 'claude-code',
+          projects: [],
           sessions: [session, background],
         });
         return;
@@ -555,7 +569,7 @@ test('approval modes are described where they are chosen, and models sit behind 
   const menu = page.getByRole('menu', { name: '审批模式' });
   await expect(menu.getByRole('menuitemradio')).toHaveCount(4);
   await expect(menu.getByRole('menuitemradio', { name: '自动审批', exact: true })).toBeChecked();
-  await expect(menu).toContainText('只调研并给出计划，不做改动');
+  await expect(menu).toContainText('只调研并写出计划，经你批准后才动手');
   await shot(page, '12-审批模式');
   await menu.getByRole('menuitemradio', { name: '手动审批', exact: true }).click();
   await expect(trigger).toContainText('手动审批');
@@ -624,9 +638,11 @@ test('Electron: frameless window, the project branch, files by path and window s
     env,
   });
   try {
-    const page = await application.firstWindow();
-    await expect(page.getByRole('heading', { name: '连接代理服务', exact: true })).toBeVisible();
-    await login(page);
+    const launcher = await application.firstWindow();
+    await expect(
+      launcher.getByRole('heading', { name: '连接代理服务', exact: true }),
+    ).toBeVisible();
+    const page = await signInWindow(application);
     // This repository stands in for the user's project.
     const repository = resolve('.');
     const picked = resolve('package.json');

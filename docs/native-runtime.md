@@ -10,7 +10,7 @@
 
 模型列表来自 CLI 初始化，桌面端不维护型号名单。CLI 按账号和提供方使用官方动态目录或内置目录；SDK 的 `supportedModels()` 返回初始化快照。空闲时“刷新模型列表”启动新的 CLI 读取状态。动态目录可带来新型号，内置目录和能力支持仍随 CLI 版本更新。
 
-代理有意变化限于外层：稳定 cwd / session ID、Windows SSH 提示词、用户选择的审批模式、可选的提供方 settings、公开增量输出、思考摘要显示（`--thinking-display summarized`）和官方持久化 / 恢复。不设置禁用遥测的变量，不默认限制任务轮数。自动更新关闭（`DISABLE_AUTOUPDATER=1`）：CLI 版本随服务端发布固定，交互式 CLI 不再在 ccdt 里提示更新、也不再自己执行 `npm install -g`。服务读完自身配置后即从进程环境删除 `PROXY_*` / `FRPS_*` 与四个服务专用的 `CLAUDE_*` 变量，原生 CLI、其 shell 与控制终端继承到的只有宿主环境本身（容器内为 `HOME`、`PATH` 等），不含代理 token 或部署配置；用户有意放进环境的其他变量原样保留。这只避免无意带出：CLI 与服务同属一个 Linux 用户，配置文件仍可被读取，不构成多用户隔离。对“内层完全不变”的工程解释是同一原生可执行与 agent 引擎，不是声称 headless / SDK 和终端 TTY 环境或未公开服务端判断逐项相同。
+代理有意变化限于外层：稳定 cwd / session ID、Windows SSH 提示词、用户选择的审批模式、可选的提供方 settings、公开增量输出、思考摘要显示（无界面运行不读 `showThinkingSummaries`，该项开启时代为传 `--thinking-display summarized`，未设置时与交互式 CLI 一样不显示）和官方持久化 / 恢复。不设置禁用遥测的变量，不默认限制任务轮数。自动更新关闭（`DISABLE_AUTOUPDATER=1`）：CLI 版本随服务端发布固定，交互式 CLI 不再在 ccdt 里提示更新、也不再自己执行 `npm install -g`。服务读完自身配置后即从进程环境删除 `PROXY_*` / `FRPS_*` 与四个服务专用的 `CLAUDE_*` 变量，原生 CLI、其 shell 与控制终端继承到的只有宿主环境本身（容器内为 `HOME`、`PATH` 等），不含代理 token 或部署配置；用户有意放进环境的其他变量原样保留。这只避免无意带出：CLI 与服务同属一个 Linux 用户，配置文件仍可被读取，不构成多用户隔离。对“内层完全不变”的工程解释是同一原生可执行与 agent 引擎，不是声称 headless / SDK 和终端 TTY 环境或未公开服务端判断逐项相同。
 
 后台任务（后台 Bash 命令、子代理）活在 CLI 进程里，任务结束时 CLI 自己开始下一轮。一轮结束时若还有后台任务，服务端不关闭 CLI：运行状态改为“等待后台任务”，界面把这一轮视为已完成，列出任务并可逐个结束，期间可以继续发消息。任务结束后 CLI 开始的那一轮照常显示；任务全部结束且没有新的一轮时运行结束。停止运行会结束 CLI，后台任务随之终止。任务列表取自 SDK 的 `background_tasks_changed` 消息，不计标记为 ambient 的任务；结束单个任务用 SDK 的 `stopTask`。
 
@@ -44,12 +44,14 @@ Linux 工作目录（见下文“上下文的权威”）在会话有了原生�
 Claude Code 原生存储是模型会话上下文的唯一权威，包含原生消息链、工具结果、压缩记录与原生长期记忆。Linux 普通用户的原生配置目录由 CLI 决定（默认 `~/.claude/`）；本项目不解析和重写 JSONL，不在 Windows 自建上下文管理器，也不用 UI transcript 重新拼历史提示词。
 
 - 每个代理会话绑定同一个 native session ID。Linux cwd 按项目分配：一台设备上的一个项目目录对应 `PROXY_DATA_DIR/native/<root>/`，该项目的会话共用它，如同在本机项目目录里使用 Claude Code，原生的会话历史、自动记忆和项目级设置因此按项目共享。没有项目的普通会话各有自己的文件夹，也就各有一个目录。对应关系记在 `sessions.sqlite` 的 `native_roots` 表里，项目路径按 Windows 不区分大小写、两种分隔符等同的规则比较；会话记下自己的 `nativeRoot`。按项目分配之前建立的会话没有记下它，仍在 `native/<会话 ID>/`，照常恢复，不迁移。
+- 项目由服务端登记：`sessions.sqlite` 的 `projects` 表按设备和路径（与 `native_roots` 同一个键）记下用户的项目、显示名称和加入的先后，经 `ready` 与 `projects` 消息发给每个窗口，各台电脑、浏览器和 `ccdt` 看到的是同一份，离线电脑的项目也在其中。会话所在的设备和文件夹登记为项目，它就属于这个项目，否则是普通会话。在一个文件夹里新建（普通会话除外）、移入或分叉会话时，这个文件夹随之登记；“添加项目”只登记。移除项目只删登记：文件夹、其中的会话和 `native/<root>/` 都留着，会话从此是普通会话；重新添加后它们回到项目里，Claude Code 的记忆也还在。登记表第一次建立时取自已有会话所在的文件夹，桌面为普通会话建的 `<日期>\<时间>` 文件夹和服务端自己的 `native/` 除外；客户端以前在本机保存的项目列表和名称，由升级时已有的每个连接第一次连上时交给自己的服务。
 - 首轮 `sessionId`，后续 `resume`；显式 `persistSession: true`。即使每轮启动新 CLI 进程，原生上下文仍由同一 session 恢复。
 - 恢复前通过官方 `getSessionInfo` 检查原生记录存在；缺失则明确失败，不静默另开会话，不用代理事件假装恢复。
 - 运行结束通过官方接口确认记录已保存，并同步保存状态到 GUI。压缩由 CLI 执行，客户端只展示实际公开的压缩 / 状态事件。
 - SSH 配置里一台设备的每种 shell 一个主机名，另有 `device`。`device` 原样执行一条命令行（Windows 上由 cmd.exe 解析），scp / sftp 也用它；`device-pwsh`、`device-bash`（Windows 上的 Git Bash）、`device-zsh` 等是同一台设备加上一条固定的 `RemoteCommand`，把标准输入整段当作那种 shell 的脚本执行，UTF-8、保留退出码。提示词让 Claude 按脚本所用的 shell 把它用 here-document 送给对应的主机，脚本不经过任何一层命令行，不需要转义或编码，也没有长度限制；偏好的 shell 只是提示词里的一句话，两种都能用。就绪探测走设备一定有的那种 shell。PowerShell 自带的 `-Command -` 与 `-File -` 逐行处理标准输入，跨行的块会丢失，所以 `device-pwsh` 先读完整段再执行；Git Bash 前先把命令共用的无窗口控制台切到 UTF-8，脚本调用的 cmd、ping 等 Windows 程序才不按系统代码页（中文系统是 GBK）输出。
 - 每台设备另有一个固定的入口 `devices/<device-id>/`：端口和配置路径在设备在线及宽限期内不变，密钥随每次连接更换；会话的 SSH 配置指向它，所以重连对正在运行的 CLI 没有任何可见变化，设备不在时新发起的命令在入口处等待（最长一分钟）。
 - 临时 SSH config / key 在 `connections/<connection-id>/`；断连回收这个目录，不碰 `native/` 下的工作目录、CLI 原生 transcript 或记忆。每个会话另有固定的 `session-ssh/<session-id>/`：`config` 先 `Include` 设备入口的配置，其余主机再读用户和系统自己的 ssh 配置（`ssh -F` 会替换掉它们）；`bin/` 里的 `ssh`、`scp`、`sftp` 只是带上 `-F config` 调用系统的同名程序，服务端把这个目录放在会话 CLI 的 PATH 最前面。于是 Claude 照常写 `ssh device-pwsh`，连其他主机也和普通 `ssh` 一样；提示词里不出现任何路径，重连和换连接都不改变它，模型侧的提示缓存保持有效。
+- 用户其他在线的电脑也在会话的 SSH 配置里：服务端在设备上线、下线或改名时重写 `devices/hosts` 与 `devices/list`，每台一组主机名 `device-<名字>` 及其各 shell 的 `device-<名字>-pwsh` 等，指向那台的固定入口；名字取设备名里的字母数字，取不出、或与 `device` 及其 shell、其他设备重名时，用设备 ID 的前六位区分。会话的 `bin/devices` 列出它们和各自的主机名，并标出哪台是本会话的电脑。提示词只多一句固定的话：`device` 总指本会话的电脑，用户说到其他电脑时用 `devices` 查，在那里只做用户要求的事，改动前先确认；设备的变化不进提示词，也就不影响提示缓存。这不是新的权限：服务端上的 Claude 本来就能读到各设备入口的配置，这样只是让它按用户的意思找得到、用得规范；审批照常由 Claude Code 自己做，访问其他电脑的命令在审批卡片上就是 `ssh device-<名字>…`。
 
 代理 `PROXY_DATA_DIR/sessions.sqlite` 只是 GUI 事件、项目绑定、审批偏好与索引的展示镜像；Windows 只有有界会话内容缓存与草稿，打开会话按页拉取，不重放所有 token。镜像里一段输出只存一条；输出途中的片段只转发给正在看的窗口，不落盘。不应把“界面历史存在”当作“原生上下文存在”。
 
@@ -92,4 +94,4 @@ OAuth 错误保留官方的具体说明，包括多行网络错误；设置保�
 
 新会话默认请求原生 `auto`，CLI 自己判断风险；没有本项目第二套 AI 审批器，也不把 auto 换成 bypassPermissions。GUI 可改为原生 `default` / `plan` / `acceptEdits`，偏好保存在 Linux；`bypassPermissions`（绕过权限，什么都不再询问）只在使用者于“设置 → 常规 → 审批”里允许后才出现在选项里，选中前再确认一次，从不作为默认。实际模式读取 `system.init.permissionMode`；版本 / 模型 / 提供方不支持时显示实际值及原生提示。
 
-`canUseTool` 仍接出原生升级到用户的请求，仅作为必要时人工允许 / 拒绝入口；Claude 的提问（`AskUserQuestion`）走同一入口，界面展示问题与选项，用户的选择按官方结构放进 `updatedInput.answers` 返回，不回答则按拒绝返回；不能因默认 auto 就移除或自动允许所有请求。`auto` 下多数操作不需要人工，但这不是所有命令、模型或提供方都不需要人工的保证。
+`canUseTool` 仍接出原生升级到用户的请求，仅作为必要时人工允许 / 拒绝入口；Claude 的提问（`AskUserQuestion`）走同一入口，界面展示问题与选项，用户的选择按官方结构放进 `updatedInput.answers` 返回，不回答则按拒绝返回；不能因默认 auto 就移除或自动允许所有请求。计划模式同样只接线：Claude 在计划模式下把计划写进 CLI 的计划文件后请求执行（`ExitPlanMode`），CLI 把计划正文和文件路径放进这次请求；界面以文档卡片展示，批准时按官方计划审批的做法以 `updatedPermissions` 的 `setMode` 指定执行模式（自动审批 / 接受编辑 / 手动审批，默认进入计划前的模式），修改过的计划放进 `updatedInput.plan`（CLI 写回计划文件并告诉 Claude 计划被用户改过），退回则把意见作为拒绝理由交给 Claude。Claude 自己进入计划模式（`EnterPlanMode`）不经审批。运行中模式的变化以 CLI 的 `system.status.permissionMode` 为准，服务据此更新会话，下一轮按它启动。官方终端的“清空上下文后执行”和云端 Ultraplan 不在 SDK 审批接口里，不提供。任务清单工具由 CLI 按模型决定是否提供（新模型默认不提供），本项目不另行开启。`auto` 下多数操作不需要人工，但这不是所有命令、模型或提供方都不需要人工的保证。

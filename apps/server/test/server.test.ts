@@ -7,8 +7,9 @@ import { test } from 'node:test';
 import type { TestContext } from 'node:test';
 import { WebSocket } from 'ws';
 import { PROTOCOL_VERSION, serverMessageSchema } from '@cc-desk-tunnel/protocol';
-import type { ServerMessage, Session, SessionEvent } from '@cc-desk-tunnel/protocol';
+import type { Project, ServerMessage, Session, SessionEvent } from '@cc-desk-tunnel/protocol';
 import { readIdleCompaction } from '../src/idle-compaction.ts';
+import { quotas } from '../src/claude.ts';
 import { createProxyServer, upgradeHeld } from '../src/server.ts';
 import { SessionStore } from '../src/store.ts';
 import { serviceVersion } from '../src/updates.ts';
@@ -738,6 +739,95 @@ test('native permission preference defaults to auto and persists; changing a run
   assert.ok(busy.type === 'response' && !busy.ok && busy.code === 'run_active');
 });
 
+test("Claude's plan approved in a mode moves the session into it; only a plan's answer may carry one", async (t) => {
+  const f = await fixture(t);
+  const client = await f.connect();
+  const sessionId = await f.create(client);
+  const other = await f.create(client);
+  // Claude goes into plan mode by itself: the session follows, remembering the mode it was in.
+  await client.request({ type: 'message.send', sessionId, text: '做个计划', scenario: 'plan' });
+  const asked = await client.event('approval.requested');
+  assert.ok(asked.type === 'session.event' && asked.event.payload.type === 'approval.requested');
+  assert.equal(f.server.store.get(sessionId).session.permissionMode, 'plan');
+  assert.equal(f.server.store.get(sessionId).session.modeBeforePlan, 'auto');
+  // An approval of anything else cannot change the mode by its answer.
+  await client.request({ type: 'message.send', sessionId: other, text: '工具', scenario: 'tool' });
+  const tool = await client.wait(
+    (message) =>
+      message.type === 'session.event' &&
+      message.event.sessionId === other &&
+      message.event.payload.type === 'approval.requested',
+  );
+  assert.ok(tool.type === 'session.event' && tool.event.payload.type === 'approval.requested');
+  const refused = await client.request({
+    type: 'approval.reply',
+    sessionId: other,
+    runId: tool.event.runId,
+    approvalId: tool.event.payload.approvalId,
+    allowed: true,
+    plan: { mode: 'acceptEdits' },
+  });
+  assert.ok(refused.type === 'response' && !refused.ok && refused.code === 'approval_invalid');
+  const approved = await client.request({
+    type: 'approval.reply',
+    sessionId,
+    runId: asked.event.runId,
+    approvalId: asked.event.payload.approvalId,
+    allowed: true,
+    plan: { mode: 'acceptEdits', edited: '# 改过的计划' },
+  });
+  assert.ok(approved.type === 'response' && approved.ok);
+  const resolved = await client.event('approval.resolved');
+  assert.ok(resolved.type === 'session.event');
+  assert.deepEqual(resolved.event.payload, {
+    type: 'approval.resolved',
+    approvalId: asked.event.payload.approvalId,
+    allowed: true,
+    mode: 'acceptEdits',
+    edited: true,
+  });
+  await client.wait(
+    (message) =>
+      message.type === 'session.updated' &&
+      message.session.id === sessionId &&
+      message.session.permissionMode === 'acceptEdits',
+  );
+  // Sent back, the plan leaves the session planning, and Claude reads why.
+  await client.wait(
+    (message) =>
+      message.type === 'session.event' &&
+      message.event.runId === asked.event.runId &&
+      message.event.payload.type === 'run.status' &&
+      message.event.payload.status === 'completed',
+  );
+  await client.request({ type: 'message.send', sessionId, text: '再计划', scenario: 'plan' });
+  const again = await client.event('approval.requested');
+  assert.ok(again.type === 'session.event' && again.event.payload.type === 'approval.requested');
+  assert.equal(f.server.store.get(sessionId).session.modeBeforePlan, 'acceptEdits');
+  const planTool = again.event.payload.toolId;
+  await client.request({
+    type: 'approval.reply',
+    sessionId,
+    runId: again.event.runId,
+    approvalId: again.event.payload.approvalId,
+    allowed: false,
+    plan: { feedback: '先别动第二步' },
+  });
+  const result = await client.wait(
+    (message) =>
+      message.type === 'session.event' &&
+      message.event.payload.type === 'tool.result' &&
+      message.event.payload.toolId === planTool,
+  );
+  assert.ok(result.type === 'session.event' && result.event.payload.type === 'tool.result');
+  assert.equal(result.event.payload.status, 'denied');
+  assert.match(result.event.payload.output, /Their feedback:\n先别动第二步/);
+  assert.equal(f.server.store.get(sessionId).session.permissionMode, 'plan');
+  const restored = new SessionStore(f.directory);
+  assert.equal(restored.get(sessionId).session.modeBeforePlan, 'acceptEdits');
+  restored.close();
+});
+
 test('session directory does not push history; switching subscribes to only the current session', async (t) => {
   const f = await fixture(t);
   const owner = await f.connect();
@@ -1153,4 +1243,160 @@ test('an upgrade is held back only by what is at work, and says what that is', (
     /「会话0」「会话1」「会话2」 等 5 个会话正在运行/,
   );
   assert.match(upgradeHeld([], true, true) ?? '', /有会话正在移动或修改，Claude 账号正在登录/);
+});
+
+test('the projects are kept by the service, told to every window, and named or removed from any', async (t) => {
+  const f = await fixture(t);
+  const laptop = { id: randomUUID(), name: '笔记本' };
+  const desk = await f.connect();
+  let away = await f.connect(laptop);
+  const told = async (client: Client, check: (list: Project[]) => boolean) => {
+    const message = await client.wait((item) => item.type === 'projects' && check(item.projects));
+    assert.ok(message.type === 'projects');
+    return message.projects;
+  };
+  // Added on the laptop, as the laptop's, and every window is told; adding it again changes nothing.
+  for (let time = 0; time < 2; time++) {
+    const added = await away.request({ type: 'project.add', path: 'E:\\笔记本\\项目' });
+    assert.ok(added.type === 'response' && added.ok);
+  }
+  const list = await told(desk, (projects) => projects.length === 1);
+  assert.deepEqual(
+    list.map(({ device, path, name }) => [device, path, name]),
+    [[laptop, 'E:\\笔记本\\项目', undefined]],
+  );
+  // Its sessions work in the directory it names on the service.
+  const made = await away.request({
+    type: 'session.create',
+    title: '在笔记本上',
+    projectPath: 'e:/笔记本/项目',
+  });
+  assert.ok(made.type === 'response' && made.sessionId);
+  assert.equal(f.server.store.get(made.sessionId).session.nativeRoot, list[0].root);
+  // Named from the desk, and an empty name gives it back the folder's.
+  const renamed = await desk.request({
+    type: 'project.rename',
+    deviceId: laptop.id,
+    path: 'e:\\笔记本\\项目',
+    name: '笔记',
+  });
+  assert.ok(renamed.type === 'response' && renamed.ok);
+  await told(away, (projects) => projects[0]?.name === '笔记');
+  await desk.request({
+    type: 'project.rename',
+    deviceId: laptop.id,
+    path: 'E:\\笔记本\\项目',
+    name: '',
+  });
+  await told(away, (projects) => projects.length === 1 && !projects[0].name);
+  // A computer that signs in under another name has its projects follow; one that is gone still has them, and a
+  // window that signs in is told them.
+  away.send({ type: 'leave' });
+  away.socket.terminate();
+  away = await f.connect({ ...laptop, name: '新笔记本' });
+  await told(desk, (projects) => projects[0]?.device.name === '新笔记本');
+  away.send({ type: 'leave' });
+  away.socket.terminate();
+  const late = new Client(f.url);
+  f.clients.push(late);
+  const ready = await late.open();
+  assert.ok(ready.type === 'ready');
+  assert.deepEqual(
+    ready.projects.map(({ device, path }) => [device.name, path]),
+    [['新笔记本', 'E:\\笔记本\\项目']],
+  );
+  // Removed from the desk while the laptop is away: its session stays where it is, a plain one now.
+  const removed = await desk.request({
+    type: 'project.remove',
+    deviceId: laptop.id,
+    path: 'E:\\笔记本\\项目',
+  });
+  assert.ok(removed.type === 'response' && removed.ok);
+  await told(desk, (projects) => projects.length === 0);
+  assert.equal(f.server.store.get(made.sessionId).session.projectPath, 'e:/笔记本/项目');
+  const missing = await desk.request({
+    type: 'project.remove',
+    deviceId: laptop.id,
+    path: 'E:\\笔记本\\项目',
+  });
+  assert.ok(missing.type === 'response' && !missing.ok && missing.code === 'not_found');
+  // Made a project again, it has the directory it had, and with it what Claude Code kept there.
+  away = await f.connect(laptop);
+  await away.request({ type: 'project.add', path: 'E:\\笔记本\\项目', name: '回来了' });
+  const back = await told(desk, (projects) => projects[0]?.name === '回来了');
+  assert.deepEqual([back.length, back[0].root], [1, list[0].root]);
+});
+
+test('a session is started on or moved to a project of another connected computer, and nowhere else', async (t) => {
+  const f = await fixture(t);
+  const laptop = { id: randomUUID(), name: '笔记本' };
+  const desk = await f.connect();
+  const away = await f.connect(laptop);
+  const said = await away.request({ type: 'project.add', path: 'E:\\笔记本\\项目' });
+  assert.ok(said.type === 'response' && said.ok);
+  // Started from the desk, the session is the laptop's.
+  const made = await desk.request({
+    type: 'session.create',
+    title: '在笔记本上',
+    projectPath: 'e:\\笔记本\\项目',
+    deviceId: laptop.id,
+  });
+  assert.ok(made.type === 'response' && made.ok && made.sessionId);
+  const there = f.server.store.get(made.sessionId).session;
+  assert.deepEqual([there.device, there.projectPath], [laptop, 'e:\\笔记本\\项目']);
+  // Not in a folder that is no project there.
+  const unknown = await desk.request({
+    type: 'session.create',
+    title: '别处',
+    projectPath: 'E:\\别处',
+    deviceId: laptop.id,
+  });
+  assert.ok(unknown.type === 'response' && !unknown.ok && unknown.code === 'unknown_project');
+  // A session of the desk moves there too.
+  const own = await desk.request({
+    type: 'session.create',
+    title: '本机',
+    projectPath: 'D:\\工作\\测试',
+  });
+  assert.ok(own.type === 'response' && own.sessionId);
+  const moved = await desk.request({
+    type: 'session.move',
+    sessionId: own.sessionId,
+    projectPath: 'E:\\笔记本\\项目',
+    deviceId: laptop.id,
+  });
+  assert.ok(moved.type === 'response' && moved.ok);
+  assert.deepEqual(f.server.store.get(own.sessionId).session.device, laptop);
+  // Not to a computer that is gone.
+  desk.forgetDevices();
+  away.send({ type: 'leave' });
+  away.socket.terminate();
+  await desk.wait((message) => message.type === 'devices' && message.devices.length === 1);
+  const gone = await desk.request({
+    type: 'session.create',
+    title: '不在了',
+    projectPath: 'E:\\笔记本\\项目',
+    deviceId: laptop.id,
+  });
+  assert.ok(gone.type === 'response' && !gone.ok && gone.code === 'device_offline');
+});
+
+test('the quota is the account’s: a new connection is handed what the service holds, and every connection hears each change', async (t) => {
+  const f = await fixture(t);
+  quotas.clear();
+  t.after(() => quotas.clear());
+  const first = await f.connect();
+  const resetsAt = new Date(Date.now() + 3600_000).toISOString();
+  const used = (message: ServerMessage) =>
+    message.type === 'quota' ? message.rateLimits?.windows[0]?.utilization : undefined;
+  quotas.observeTerminal([{ name: 'five_hour', utilization: 12, resetsAt }]);
+  assert.equal(used(await first.wait((message) => message.type === 'quota')), 12);
+  const late = new Client(f.url, undefined, { id: randomUUID(), name: '另一台' });
+  f.clients.push(late);
+  const ready = await late.open();
+  assert.ok(ready.type === 'ready');
+  assert.equal(ready.quota?.rateLimits?.windows[0]?.utilization, 12);
+  quotas.observeTerminal([{ name: 'five_hour', utilization: 13, resetsAt }]);
+  for (const client of [first, late])
+    assert.equal(used(await client.wait((message) => message.type === 'quota')), 13);
 });
