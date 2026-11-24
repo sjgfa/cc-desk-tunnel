@@ -65,6 +65,7 @@ import {
 } from './claude.ts';
 import type { ClaudeOptions, PlanDecision, Unanswered } from './claude.ts';
 import { ClientReleases } from './client-release.ts';
+import { sendControl } from './control-send.ts';
 import { DomainError } from './errors.ts';
 import { HistoryDelivery } from './history-delivery.ts';
 import type { NativeLogin } from './native-account.ts';
@@ -119,6 +120,7 @@ type Peer = {
   device?: Device;
   tunnel?: Tunnel;
   registering: boolean;
+  channelOf?: string;
   // The client said it was closing the connection: nothing is kept for it to come back to.
   left: boolean;
   // The client keeps the plan quota current on its screen, so the service reads it while runs go on.
@@ -341,7 +343,11 @@ export function createProxyServer(options: ServerOptions) {
     reverseProxy: options.reverseProxy,
     host: options.host ?? '127.0.0.1',
   });
-  const serverDevice: Device = { id: web.serverDeviceId, name: '服务端', platform: 'linux' };
+  const serverDevice: Device = {
+    id: web.serverDeviceId,
+    name: '服务端',
+    platform: process.platform === 'darwin' ? 'darwin' : 'linux',
+  };
   const originOf = (request: IncomingMessage) =>
     `${options.tls || options.reverseProxy ? 'https' : 'http'}://${request.headers.host}`;
   // Behind the reverse proxy every socket comes from the proxy itself; it passes the client on in X-Real-IP.
@@ -450,11 +456,7 @@ export function createProxyServer(options: ServerOptions) {
   });
 
   function send(peer: Peer, message: ServerMessage) {
-    // History benefits from compression; small live events and control replies do not need it.
-    if (peer.socket.readyState === WebSocket.OPEN)
-      peer.socket.send(JSON.stringify(message), {
-        compress: message.type === 'session.snapshot' || message.type === 'session.history.part',
-      });
+    sendControl(peer.socket, message);
   }
   function broadcast(message: ServerMessage, sessionId?: string) {
     for (const peer of peers) {
@@ -2069,6 +2071,7 @@ export function createProxyServer(options: ServerOptions) {
       peer.socket.close(TUNNEL_CLOSE.unknown, 'Unknown channel');
       return false;
     }
+    peer.channelOf = tunnel.id;
     return true;
   }
   // A connection for the file panel, signed in with the secret of its control connection's execution channel.
@@ -2103,7 +2106,14 @@ export function createProxyServer(options: ServerOptions) {
       if (target === 'server') return files.ownServer();
       const ssh = seats.get(target)?.door;
       return ssh?.ready && ssh.ssh
-        ? [program('ssh'), '-F', ssh.ssh.configPath, '-s', 'device', 'sftp']
+        ? [
+            program('ssh'),
+            '-F',
+            ssh.ssh.fileConfigPath ?? ssh.ssh.configPath,
+            '-s',
+            'device',
+            'sftp',
+          ]
         : undefined;
     });
     return true;
@@ -2323,6 +2333,7 @@ export function createProxyServer(options: ServerOptions) {
       // about 45 seconds of silence, end the connection.
       let missed = 0;
       let timedOut = false;
+      let receivedSsh = false;
       // Whether this connection still holds one of the places for those that have not signed in.
       let signedIn = false;
       let greeted = false;
@@ -2330,6 +2341,14 @@ export function createProxyServer(options: ServerOptions) {
         missed = 0;
       });
       const heartbeat = setInterval(() => {
+        if (socket.readyState !== WebSocket.OPEN) return;
+        if (receivedSsh) {
+          // On a busy device-to-service channel a ping can be behind file data.
+          // Confirm receipt to the device's existing pong-based heartbeat.
+          receivedSsh = false;
+          missed = 0;
+          socket.pong();
+        }
         if (missed >= 2) {
           timedOut = true;
           socket.terminate();
@@ -2365,6 +2384,10 @@ export function createProxyServer(options: ServerOptions) {
                 ? attachFiles(peer, value)
                 : authenticate(peer, value)
           ) {
+            if (kind === 'tunnel.attach')
+              socket.on('message', (_data, binary) => {
+                if (binary) receivedSsh = true;
+              });
             clearTimeout(authTimer);
             signedIn = true;
             gate.leave(address);
@@ -2465,6 +2488,10 @@ export function createProxyServer(options: ServerOptions) {
         clearTimeout(authTimer);
         clearInterval(heartbeat);
         if (!signedIn) gate.leave(address);
+        if (peer.channelOf && !closing && code !== 1000 && code !== 1005)
+          console.log(
+            `${new Date().toISOString()} SSH channel on ${peer.channelOf.slice(0, 8)} closed after ${Math.round((Date.now() - opened) / 1000)} s: ${timedOut ? 'no heartbeat answer for 45s' : `code ${code}`}`,
+          );
         // Why a connection ended is the first thing needed when a run was cut short.
         const device = peer.device?.id;
         const before = [...runs.values()].filter((run) => run.device === device).length;

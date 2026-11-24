@@ -2,6 +2,8 @@
 
 <img src="apps/desktop/public/assets/icon-192.png" width="88" alt="CC Desk Tunnel 图标">
 
+> 本 fork 维护 macOS 原生服务适配和客户端修复，基线为上游 v0.3.19。详见 [Fork 维护说明](FORK.md)。
+
 # CC Desk Tunnel
 
 **一台服务器上的 Claude Code，做你所有电脑共同的大脑**

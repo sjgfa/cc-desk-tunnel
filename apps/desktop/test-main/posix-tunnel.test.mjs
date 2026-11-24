@@ -21,6 +21,7 @@ const posix = { skip: process.platform === 'win32' || !existsSync('/bin/zsh'), t
 
 async function connected(t) {
   const { createProxyServer } = await import('../../server/src/server.ts');
+  const { sessionSsh } = await import('../../server/src/tunnel.ts');
   // Short, for the socket of the shared SSH connection.
   const directory = await mkdtemp('/tmp/cc-tunnel-');
   const home = join(directory, 'home');
@@ -92,6 +93,10 @@ async function connected(t) {
     assert.ok(Date.now() < deadline, 'the device got no SSH configuration');
     await delay(20);
   }
+  const session = sessionSsh(dataDir, randomUUID(), {
+    configPath: config,
+    fileConfigPath: join(dataDir, 'devices', id, 'ssh_file_config'),
+  });
   const run = (program, args, input) =>
     new Promise((done) => {
       const child = execFile(program, args, { timeout: 30000 }, (error, stdout, stderr) =>
@@ -106,9 +111,15 @@ async function connected(t) {
     schedules,
     bridge,
     // The host of scripts in the user's own shell, zsh here (see below).
-    script: (text) => run('ssh', ['-F', config, 'device-zsh'], text),
-    command: (line) => run('ssh', ['-F', config, 'device', line], ''),
-    scp: (from, to) => run('scp', ['-q', '-F', config, from, to], ''),
+    script: (text) => run(join(session.bin, 'ssh'), ['device-zsh'], text),
+    command: (line) => run(join(session.bin, 'ssh'), ['device', line], ''),
+    scp: (from, to) => run(join(session.bin, 'scp'), ['-q', from, to], ''),
+    masters: () =>
+      Promise.all(
+        [session.configPath, session.fileConfigPath].map((path) =>
+          run('ssh', ['-F', path, '-O', 'check', 'device'], ''),
+        ),
+      ),
   };
 }
 
@@ -147,6 +158,14 @@ test(
       (await device.script(`wc -c < '${device.project}/大 文件.bin' | tr -d ' \\n'\n`)).stdout,
       String(8 * 1024 * 1024),
     );
+    const masters = await device.masters();
+    const pids = masters.map(({ code, stderr }) => {
+      assert.equal(code, 0, stderr);
+      const pid = /pid=(\d+)/.exec(stderr)?.[1];
+      assert.ok(pid, stderr);
+      return pid;
+    });
+    assert.notEqual(pids[0], pids[1], 'the file transfer must not queue later commands');
   },
 );
 

@@ -53,6 +53,8 @@ export function environmentConfig(env: NodeJS.ProcessEnv, defaultDataDir: string
           }
         : undefined,
     tunnel: native ? {} : undefined,
+    // macOS has no Landlock to separate the service account's credentials from its file panel.
+    files: native && process.platform === 'darwin' ? { sftpServer: null } : undefined,
     maxRuns,
     graceMs: grace === undefined ? undefined : grace * 1000,
     allowedOrigins: env.PROXY_ORIGINS?.split(','),

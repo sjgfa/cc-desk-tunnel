@@ -1,5 +1,5 @@
 import { execFile } from 'node:child_process';
-import { existsSync, mkdirSync, writeFileSync, renameSync, rmSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, writeFileSync, renameSync, rmSync } from 'node:fs';
 import { createServer } from 'node:net';
 import type { AddressInfo, Server, Socket } from 'node:net';
 import { delimiter, join } from 'node:path';
@@ -14,6 +14,7 @@ import type {
   TunnelCredentials,
 } from '@cc-desk-tunnel/protocol';
 import { systemShell } from './device-terms.ts';
+import { sendSshBytes } from './channel-flow.ts';
 
 export type TunnelOptions = {
   // How long an SSH connection waits for the device to open its channel before it is dropped.
@@ -24,12 +25,15 @@ export type TunnelOptions = {
   holdMs?: number;
 };
 // `bin`, for a session, holds the `ssh`, `scp` and `sftp` its CLI finds first on its PATH.
-export type SshConnection = { configPath: string; bin?: string };
+export type SshConnection = { configPath: string; fileConfigPath?: string; bin?: string };
 
 // SSH connections that may wait for their channel at once, and that may be open at once. Far above what one
 // device's commands need; they bound what a stray local process connecting to the port can make the device do.
 const MAX_WAITING = 32;
 const MAX_CHANNELS = 128;
+// A desktop TLS dial alone may take 15 seconds. Allow for that and for the
+// channel request to reach the device on a busy link.
+const PAIR_MS = 25_000;
 // How long a channel whose SSH connection ended has to deliver the rest and close.
 const CLOSING_MS = 10_000;
 
@@ -61,20 +65,20 @@ export function sessionSsh(
     writeFileSync(next, text, { mode });
     renameSync(next, path);
   };
-  write(
-    configPath,
-    `Include ${JSON.stringify(ssh.configPath)}\nInclude ${JSON.stringify(join(dataDir, 'devices', 'hosts'))}\nHost * !device !device-*\n  Include ~/.ssh/config /etc/ssh/ssh_config\n`,
-    0o600,
-  );
+  const include = (path: string, hosts = 'hosts') =>
+    `Include ${JSON.stringify(path)}\nInclude ${JSON.stringify(join(dataDir, 'devices', hosts))}\nHost * !device !device-*\n  Include ~/.ssh/config /etc/ssh/ssh_config\n`;
+  write(configPath, include(ssh.configPath), 0o600);
+  const fileConfigPath = ssh.fileConfigPath ? join(directory, 'files.conf') : configPath;
+  if (ssh.fileConfigPath) write(fileConfigPath, include(ssh.fileConfigPath, 'file-hosts'), 0o600);
   write(join(bin, 'devices'), devicesScript(join(dataDir, 'devices', 'list'), device), 0o700);
   const quote = (value: string) => `'${value.replaceAll("'", "'\\''")}'`;
   for (const name of ['ssh', 'scp', 'sftp'])
     write(
       join(bin, name),
-      `#!/bin/sh\nexec ${quote(program(name))} -F ${quote(configPath)} "$@"\n`,
+      `#!/bin/sh\nexec ${quote(program(name))} -F ${quote(name === 'ssh' ? configPath : fileConfigPath)} "$@"\n`,
       0o700,
     );
-  return { configPath, bin };
+  return { configPath, fileConfigPath, bin };
 }
 // Lists the user's computers online for the session's CLI, from the list `writeDevices` keeps.
 function devicesScript(list: string, device = '') {
@@ -131,6 +135,7 @@ export function writeDevices(dataDir: string, devices: OnlineDevice[]) {
   mkdirSync(directory, { recursive: true, mode: 0o700 });
   const names = deviceHosts(devices);
   const config: string[] = [];
+  const fileConfig: string[] = [];
   const list: string[] = [];
   const system = { win32: 'Windows', darwin: 'macOS', linux: 'Linux' };
   for (const device of devices) {
@@ -138,6 +143,7 @@ export function writeDevices(dataDir: string, devices: OnlineDevice[]) {
     const hosts = device.door.hosts(name);
     if (!hosts) continue;
     config.push(hosts.config);
+    fileConfig.push(hosts.fileConfig);
     list.push(
       [
         device.id,
@@ -154,6 +160,7 @@ export function writeDevices(dataDir: string, devices: OnlineDevice[]) {
     renameSync(next, join(directory, file));
   };
   write('hosts', config.join(''));
+  write('file-hosts', fileConfig.join(''));
   write('list', list.map((line) => `${line}\n`).join(''));
 }
 
@@ -219,7 +226,7 @@ export function sshProbe(configPath: string, host: string) {
     const child = execFile(
       'ssh',
       ['-F', configPath, host],
-      { timeout: 20000, maxBuffer: 65536, encoding: 'buffer' },
+      { timeout: PAIR_MS + 10_000, maxBuffer: 65536, encoding: 'buffer' },
       (error, stdout, stderr) => {
         if (!error && stdout.toString('utf8').includes('CC_DESK_TUNNEL_SSH_READY'))
           return resolve();
@@ -227,7 +234,7 @@ export function sshProbe(configPath: string, host: string) {
         reject(
           new ProbeFailure(
             error?.killed
-              ? '20 秒内没有应答。'
+              ? `${(PAIR_MS + 10_000) / 1000} 秒内没有应答。`
               : said || `没有输出${error ? `（退出代码 ${error.code}）` : ''}。`,
           ),
         );
@@ -240,10 +247,29 @@ export function sshProbe(configPath: string, host: string) {
 }
 // Where the commands of one device share an SSH connection, or nothing when they cannot: the `ssh` of Windows,
 // which tests run this service with, has no connection sharing, and the path of a Unix socket is limited to
-// 108 bytes, of which `ssh` takes 17 for the name it binds under before renaming.
-export function sharedConnectionPath(directory: string, platform = process.platform) {
-  const path = join(directory, 'mux');
-  return platform !== 'win32' && Buffer.byteLength(path) <= 88 ? path : undefined;
+// 108 bytes on Linux and 104 on macOS, of which `ssh` takes 17 for the temporary name before renaming.
+export function sharedConnectionPath(directory: string, platform = process.platform, name = 'mux') {
+  const path = join(directory, name);
+  const limit = platform === 'darwin' ? 84 : 88;
+  return platform !== 'win32' && Buffer.byteLength(path) <= limit ? path : undefined;
+}
+class SshSockets {
+  private temporary?: string;
+  path(directory: string, name: string) {
+    if (process.platform === 'win32') return null;
+    const path = sharedConnectionPath(directory, process.platform, name);
+    if (path) return path;
+    // Only sockets go in this private directory, which mkdtemp creates with mode 0700.
+    try {
+      this.temporary ??= mkdtempSync('/tmp/ccdt-mux-');
+      return sharedConnectionPath(this.temporary, process.platform, name) ?? null;
+    } catch {
+      return null;
+    }
+  }
+  close() {
+    if (this.temporary) rmSync(this.temporary, { recursive: true, force: true });
+  }
 }
 export function sshConfig(
   directory: string,
@@ -258,10 +284,11 @@ export function sshConfig(
   shells: DeviceShell[] = [systemShell(device)],
   // The host name of the device, its shells' being this with theirs after it.
   name = 'device',
+  shared: string | null | undefined = sharedConnectionPath(directory, platform),
+  persist: number | 'yes' = 600,
 ) {
   if (directory.includes('\n') || directory.includes('"'))
     throw new Error('Unsupported data directory');
-  const shared = sharedConnectionPath(directory, platform);
   return {
     knownHosts: `[127.0.0.1]:${port} ${hostPublicKey}\n`,
     config: [
@@ -292,7 +319,7 @@ export function sshConfig(
       // The first command opens a connection that the following ones run over, and that stays for a while
       // after the last; it ends with the tunnel, whose close cuts it.
       ...(shared
-        ? ['  ControlMaster auto', `  ControlPath "${shared}"`, '  ControlPersist 600']
+        ? ['  ControlMaster auto', `  ControlPath "${shared}"`, `  ControlPersist ${persist}`]
         : []),
       '',
     ].join('\n'),
@@ -304,13 +331,17 @@ export function sshConfig(
 function splice(socket: Socket, channel: WebSocket) {
   const stream = createWebSocketStream(channel);
   stream.on('error', () => socket.destroy());
-  // What ssh sent before it went goes on first; a channel that does not answer its end is cut after a while.
-  socket.once('close', () => {
+  // Start the close deadline after the device has received even the last partial window.
+  sendSshBytes(socket, channel, () => {
+    if (channel.readyState === channel.OPEN) {
+      const cut = setTimeout(() => stream.destroy(), CLOSING_MS).unref();
+      stream.once('close', () => clearTimeout(cut));
+    }
     stream.end();
-    const cut = setTimeout(() => stream.destroy(), CLOSING_MS);
-    stream.once('close', () => clearTimeout(cut));
   });
-  socket.pipe(stream);
+  socket.once('close', () => {
+    if (!socket.readableEnded) stream.destroy();
+  });
   stream.pipe(socket);
 }
 
@@ -323,6 +354,8 @@ export class Tunnel {
   id: string;
   port = 0;
   ssh?: SshConnection;
+  fileMaster?: string;
+  private sockets = new SshSockets();
   controller = new AbortController();
   closePromise?: Promise<void>;
   // What the device registered with, once its SSH service answered through this tunnel.
@@ -347,7 +380,7 @@ export class Tunnel {
   ) {
     this.id = id;
     this.directory = join(dataDir, 'connections', id);
-    this.pairMs = options.pairMs ?? 10000;
+    this.pairMs = options.pairMs ?? PAIR_MS;
     this.probe = options.probe ?? sshProbe;
     this.request = request;
     this.unexpectedClose = unexpectedClose;
@@ -413,15 +446,21 @@ export class Tunnel {
       throw new Error('Inactive SSH registration');
     this.platform = platform;
     this.shells = shellsOf(platform, credentials.shells);
+    // scp and sftp join existing masters but invoke ssh with ControlMaster=no.
+    // Keep the SSH connection we must open for readiness as their transfer connection.
+    this.fileMaster = this.sockets.path(this.directory, 'mux') ?? undefined;
     const files = sshConfig(
       this.directory,
       this.port,
       credentials.username,
       credentials.hostPublicKey,
       process.platform,
-      15,
+      Math.ceil(this.pairMs / 1000) + 5,
       platform,
       this.shells,
+      'device',
+      this.fileMaster ?? null,
+      'yes',
     );
     const configPath = join(this.directory, 'ssh_config');
     writeFileSync(join(this.directory, 'identity'), credentials.privateKey, { mode: 0o600 });
@@ -461,6 +500,7 @@ export class Tunnel {
       await closed;
       this.ssh = undefined;
       rmSync(this.directory, { recursive: true, force: true });
+      this.sockets.close();
     })();
     return this.closePromise;
   }
@@ -491,6 +531,7 @@ export class Door {
   };
   private held = new Map<Socket, NodeJS.Timeout>();
   private closed = false;
+  private sockets = new SshSockets();
   constructor(options: TunnelOptions, dataDir: string, device: string) {
     this.directory = join(dataDir, 'devices', device);
     this.holdMs = options.holdMs ?? 60000;
@@ -532,6 +573,8 @@ export class Door {
     this.tunnel = tunnel;
     if (!tunnel?.credentials) return;
     const { username, hostPublicKey, privateKey } = tunnel.credentials;
+    // A newly selected tunnel has its own credentials; don't reuse a previous master.
+    const shared = this.sockets.path(this.directory, `m-${tunnel.id}`);
     this.reach = { username, hostPublicKey, platform: tunnel.platform, shells: tunnel.shells };
     const files = sshConfig(
       this.directory,
@@ -542,6 +585,8 @@ export class Door {
       Math.ceil(this.holdMs / 1000) + 15,
       tunnel.platform,
       tunnel.shells,
+      'device',
+      shared,
     );
     const write = (name: string, text: string) => {
       const next = join(this.directory, `${name}.${randomBytes(6).toString('hex')}`);
@@ -551,7 +596,16 @@ export class Door {
     write('identity', privateKey);
     write('known_hosts', files.knownHosts);
     write('ssh_config', files.config);
-    this.ssh = { configPath: join(this.directory, 'ssh_config') };
+    // Keep file transfers off the command master: its local TCP socket can already
+    // hold queued SSH bytes even when the WebSocket sender is correctly paced.
+    const configPath = join(this.directory, 'ssh_config');
+    const fileConfigPath = join(this.directory, 'ssh_file_config');
+    const fileMaster =
+      tunnel.fileMaster || shared
+        ? `Host device\n  ControlPath ${JSON.stringify(tunnel.fileMaster ?? 'none')}\nHost *\n`
+        : '';
+    write('ssh_file_config', `${fileMaster}Include ${JSON.stringify(configPath)}\n`);
+    this.ssh = { configPath, fileConfigPath };
     for (const [socket, timer] of this.held) {
       clearTimeout(timer);
       this.held.delete(socket);
@@ -563,18 +617,25 @@ export class Door {
   hosts(name: string) {
     if (!this.reach || this.closed) return undefined;
     const { username, hostPublicKey, platform, shells } = this.reach;
-    const files = sshConfig(
-      this.directory,
-      this.port,
-      username,
-      hostPublicKey,
-      process.platform,
-      Math.ceil(this.holdMs / 1000) + 15,
-      platform,
+    const tunnel = this.tunnel;
+    const config = (shared: string | null) =>
+      sshConfig(
+        this.directory,
+        this.port,
+        username,
+        hostPublicKey,
+        process.platform,
+        Math.ceil(this.holdMs / 1000) + 15,
+        platform,
+        shells,
+        name,
+        shared,
+      ).config;
+    return {
+      config: config(tunnel ? this.sockets.path(this.directory, `m-${tunnel.id}`) : null),
+      fileConfig: config(tunnel?.fileMaster ?? null),
       shells,
-      name,
-    );
-    return { config: files.config, shells };
+    };
   }
   uses(tunnel: Tunnel | undefined) {
     return this.tunnel === tunnel;
@@ -594,5 +655,6 @@ export class Door {
     for (const socket of this.held.keys()) socket.destroy();
     await closed;
     rmSync(this.directory, { recursive: true, force: true });
+    this.sockets.close();
   }
 }

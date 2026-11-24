@@ -30,6 +30,7 @@ coverage/
 .tools/
 artifacts/
 apps/desktop/vendor/
+apps/server/web/
 test-results/
 playwright-report/
 *.log
