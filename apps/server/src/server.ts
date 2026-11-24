@@ -14,7 +14,7 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { IncomingMessage, RequestListener } from 'node:http';
 import { createServer as createHttpsServer } from 'node:https';
-import { WebSocket, WebSocketServer } from 'ws';
+import { WebSocket, WebSocketServer, createWebSocketStream } from 'ws';
 import {
   deleteSession,
   forkSession,
@@ -37,6 +37,7 @@ import {
   runWorking,
   TUNNEL_CLOSE,
   tunnelAttachSchema,
+  filesAttachSchema,
   tunnelCredentialsSchema,
   terminalControlSchema,
   webActivitySchema,
@@ -62,7 +63,7 @@ import {
   quotas,
   readNativeStatus,
 } from './claude.ts';
-import type { ClaudeOptions, Unanswered } from './claude.ts';
+import type { ClaudeOptions, PlanDecision, Unanswered } from './claude.ts';
 import { ClientReleases } from './client-release.ts';
 import { DomainError } from './errors.ts';
 import { HistoryDelivery } from './history-delivery.ts';
@@ -86,7 +87,17 @@ import { inOrder } from './question.ts';
 import { simulate } from './simulation.ts';
 import { SessionStore } from './store.ts';
 import { Throttle } from './throttle.ts';
-import { Door, Tunnel, sessionSsh, sessionSshPath } from './tunnel.ts';
+import {
+  Door,
+  ProbeFailure,
+  Tunnel,
+  program,
+  sessionSsh,
+  sessionSshPath,
+  writeDevices,
+} from './tunnel.ts';
+import { FileService } from './files.ts';
+import type { FilesOptions } from './files.ts';
 import type { TunnelOptions } from './tunnel.ts';
 import { ServiceUpdates, serviceVersion } from './updates.ts';
 import type { UpdateOptions } from './updates.ts';
@@ -147,13 +158,22 @@ export type Run = {
   toolId?: string;
   toolFinished: boolean;
   approvalId?: string;
-  decide?: (allowed: boolean, answers?: Record<string, string>) => void;
+  // The simulated approval when it is a plan.
+  planApproval?: string;
+  decide?: (allowed: boolean, answers?: Record<string, string>, plan?: PlanDecision) => void;
   approvals: Map<
     string,
-    (allowed: boolean, answers?: Record<string, string>, unanswered?: Unanswered) => void
+    (
+      allowed: boolean,
+      answers?: Record<string, string>,
+      unanswered?: Unanswered,
+      plan?: PlanDecision,
+    ) => void
   >;
   // The approvals that are Claude's questions, answered or left unanswered rather than allowed or denied.
   questions: Set<string>;
+  // The approvals that are Claude's plans, which alone may be answered with a mode to carry them out in.
+  plans: Set<string>;
   // Approvals and questions answered already: a second answer, from another window or computer, came late.
   answered: Set<string>;
   cancelReason?: string;
@@ -184,9 +204,10 @@ type Terminal = {
     last?: string;
     settingsPath: string;
     hooksPath: string;
-    // What its CLI last showed in the status line, and the quota last heard from it.
+    // What its CLI last showed in the status line, and the quota and context last heard from it.
     statusPath: string;
     quota?: string;
+    context?: string;
     offset: number;
     heard: Promise<void>;
     activity?: TerminalActivity;
@@ -237,6 +258,8 @@ export type ServerOptions = {
   graceMs?: number;
   // Defaults to the frontend shipped beside the server. Tests can provide a small fixture directory.
   webDirectory?: string;
+  // How the file panel reaches the service's files; `false` offers none.
+  files?: FilesOptions | false;
 };
 
 // How many answered requests a connection remembers, to answer a resend of one the same way.
@@ -260,6 +283,11 @@ export function createProxyServer(options: ServerOptions) {
   const usageReceiver = options.claude ? createUsageReceiver(usage) : undefined;
   const peers = new Set<Peer>();
   quotas.wanted = () => [...peers].some((peer) => peer.quotaWanted);
+  // The quota is the account's: every connection hears each change, and the usage periods follow it.
+  quotas.changed = (quota) => {
+    if (quota.rateLimits?.available) usage.observe(quota.rateLimits);
+    broadcast({ type: 'quota', ...quota });
+  };
   // One run or one terminal per session, each a CLI process of its own in the session's directory. What reads
   // or changes the state the CLI keeps for all of them — a status read or session change (`mutations`), an
   // account change — waits until none is going.
@@ -267,6 +295,10 @@ export function createProxyServer(options: ServerOptions) {
   const mutations = new Map<string, 'status' | 'session'>();
   const terminals = new Map<string, Terminal>();
   const seats = new Map<string, Seat>();
+  const files =
+    options.files === false ? undefined : new FileService(options.dataDir, options.files);
+  // The file panel's connections of each control connection, which end with it.
+  const fileConnections = new Map<string, Set<WebSocket>>();
   const compactions = new IdleCompactions(store.directory, compactIdle);
   armCompactions();
   const graceMs = options.graceMs ?? (options.claude ? 300_000 : 0);
@@ -430,6 +462,26 @@ export function createProxyServer(options: ServerOptions) {
         send(peer, message);
     }
   }
+  // Where a session is made or moved to: the computer of the connection, or another of the user's that is
+  // connected, into one of its projects.
+  function destination(peer: Peer, command: { deviceId?: string; projectPath: string }) {
+    if (!command.deviceId || command.deviceId === peer.device?.id) return deviceOf(peer);
+    const seat = seats.get(command.deviceId);
+    const device = seat && [...seat.peers].findLast((other) => other.device)?.device;
+    if (!device) throw new DomainError('device_offline', '那台电脑不在线。');
+    if (!store.isProject(device.id, command.projectPath))
+      throw new DomainError('unknown_project', '那台电脑上没有这个项目。');
+    return device;
+  }
+  // Tells every window the projects when they changed.
+  let projectList = JSON.stringify(store.projects());
+  function announceProjects() {
+    const projects = store.projects();
+    const text = JSON.stringify(projects);
+    if (text === projectList) return;
+    projectList = text;
+    broadcast({ type: 'projects', projects });
+  }
   function deviceOf(peer: Peer) {
     if (!peer.device) throw new DomainError('device_unknown', '客户端没有报告设备标识。');
     return peer.device;
@@ -448,11 +500,13 @@ export function createProxyServer(options: ServerOptions) {
           '此会话在一台 Windows 电脑上。要在本机接着做，请先为它选择本机的项目目录，或把它分叉到本机。',
         );
       updated(store.claim(session.id, device).id);
+      announceProjects();
     }
     const place = session.device ?? device!;
     const seat = seats.get(place.id);
     if (place.id === device?.id) {
-      if (options.claude && !(peer.tunnel?.ssh && seat?.door?.ssh))
+      // Any connection of this computer may carry its commands: `ccdt online` does for a terminal of ccdt.
+      if (options.claude && !(seat?.door?.ready && seat.door.ssh))
         throw new DomainError(
           'execution_offline',
           '本机的执行通道尚未就绪，请稍候；客户端正在建立或重新建立连接。',
@@ -497,7 +551,28 @@ export function createProxyServer(options: ServerOptions) {
       ],
     };
   }
+  // What sessions reach the user's computers by, other than their own (see `writeDevices`).
+  function reachable() {
+    writeDevices(
+      store.directory,
+      [...seats.values()].flatMap((seat) => {
+        const device = [...seat.peers].findLast((peer) => peer.device)?.device;
+        return device && seat.door
+          ? [
+              {
+                id: device.id,
+                name: device.name,
+                platform: platformOf(device),
+                ready: seat.door.ready,
+                door: seat.door,
+              },
+            ]
+          : [];
+      }),
+    );
+  }
   function announce() {
+    if (options.tunnel && !closing) reachable();
     const message = devices();
     const text = JSON.stringify(message);
     if (closing || text === presence) return;
@@ -519,10 +594,8 @@ export function createProxyServer(options: ServerOptions) {
     broadcast({ type: 'session.updated', session: store.get(sessionId).session });
   }
 
-  // Stores an event and sends it to the session's subscribers; quota readings also drive the usage periods.
+  // Stores an event and sends it to the session's subscribers.
   function record(sessionId: string, runId: string, payload: EventPayload, createdAt?: string) {
-    if (payload.type === 'native.metrics' && payload.rateLimits?.available)
-      usage.observe(payload.rateLimits);
     const event = store.append(sessionId, runId, payload, createdAt);
     broadcast({ type: 'session.event', event }, sessionId);
     if (payload.type === 'native.metrics' && payload.cacheTtl)
@@ -596,6 +669,11 @@ export function createProxyServer(options: ServerOptions) {
         session: store.renameNative(run.sessionId, payload.title),
       });
     if (payload.type === 'native.compact') store.compacted(run.sessionId);
+    if (payload.type === 'native.mode')
+      broadcast({
+        type: 'session.updated',
+        session: store.adoptMode(run.sessionId, payload.permissionMode),
+      });
     if (payload.type === 'run.status') updated(run.sessionId);
   }
   // The CLI reports its model requests a moment after the turn ends. Wait for as many as the turn made, then
@@ -676,7 +754,7 @@ export function createProxyServer(options: ServerOptions) {
         run.device === serverDevice.id
           ? undefined
           : door
-            ? sessionSsh(store.directory, run.sessionId, door)
+            ? sessionSsh(store.directory, run.sessionId, door, run.device)
             : {
                 configPath: join(sessionSshPath(store.directory, run.sessionId), 'config'),
                 bin: join(sessionSshPath(store.directory, run.sessionId), 'bin'),
@@ -705,22 +783,29 @@ export function createProxyServer(options: ServerOptions) {
         signal: run.controller.signal,
         ssh,
         emit: (event) => emit(run, event),
-        approve: (toolId, waiting) => {
+        approve: (toolId, waiting, why) => {
           if (run.controller.signal.aborted) return Promise.resolve({ allowed: false });
           const approvalId = randomUUID();
           if (waiting === 'question') run.questions.add(approvalId);
+          if (waiting === 'plan') run.plans.add(approvalId);
           return new Promise((resolve) => {
-            run.approvals.set(approvalId, (allowed, answers, unanswered) => {
+            run.approvals.set(approvalId, (allowed, answers, unanswered, plan) => {
               run.questions.delete(approvalId);
-              emit(run, { type: 'approval.resolved', approvalId, allowed });
-              resolve({ allowed, answers, unanswered });
+              run.plans.delete(approvalId);
+              emit(run, {
+                type: 'approval.resolved',
+                approvalId,
+                allowed,
+                ...planned(allowed, plan),
+              });
+              resolve({ allowed, answers, unanswered, plan });
             });
-            emit(run, { type: 'approval.requested', approvalId, toolId });
+            emit(run, { type: 'approval.requested', approvalId, toolId, ...why });
             emit(run, {
               type: 'run.status',
               status: 'awaiting_approval',
               connectionId: run.connectionId,
-              waiting,
+              waiting: waiting === 'plan' ? 'approval' : waiting,
             });
           });
         },
@@ -952,7 +1037,9 @@ export function createProxyServer(options: ServerOptions) {
       if (closing || peer.socket.readyState !== WebSocket.OPEN)
         throw new Error('Connection closed');
       completeOnboarding();
-      const reach = ssh ? sessionSsh(store.directory, session.id, ssh) : undefined;
+      const reach = ssh
+        ? sessionSsh(store.directory, session.id, ssh, session.device?.id)
+        : undefined;
       current.process = new NativeTerminal(
         options.claude.executable,
         terminalArguments(options.claude, session, reach, {
@@ -1040,7 +1127,7 @@ export function createProxyServer(options: ServerOptions) {
       });
       updated(command.sessionId);
       watchFile(current.continued.hooksPath, { interval: 500 }, () => void heardTerminal(current));
-      watchFile(current.continued.statusPath, { interval: 1000 }, () => terminalQuota(current));
+      watchFile(current.continued.statusPath, { interval: 1000 }, () => terminalStatus(current));
       send(peer, { type: 'terminal.opened', sessionId: command.sessionId, terminalId: current.id });
     } catch {
       await current.process?.close();
@@ -1178,13 +1265,13 @@ export function createProxyServer(options: ServerOptions) {
       type: 'native.metrics',
       context: terminalContext(terminal) ?? last?.context ?? null,
       usage: last?.usage ?? null,
-      rateLimits: null,
       cacheTtl: ttl,
     });
   }
-  // The quota a terminal's CLI showed in its status line, its replies' as a chat run's stream would carry it: it goes
-  // to the account's quota, and every connection is told, as the quota is the account's, not the session's.
-  function terminalQuota(terminal: Terminal) {
+  // What a terminal's CLI showed in its status line, each part where it belongs: the quota its replies carried, as a
+  // chat run's stream would, goes to the account's (see `Quotas`); how full the context is goes to the session, as a
+  // chat run's figures do during a turn.
+  function terminalStatus(terminal: Terminal) {
     const { continued } = terminal;
     let windows;
     let context;
@@ -1196,20 +1283,20 @@ export function createProxyServer(options: ServerOptions) {
       return;
     }
     const heard = JSON.stringify(windows);
-    if (!windows.length || heard === continued.quota) return;
-    continued.quota = heard;
-    const last = store.lastMetrics(terminal.sessionId);
-    const rateLimits = quotas.observeTerminal(windows);
-    // Nothing the status line showed still holds: the quota the clients have is left as it is.
-    if (!rateLimits?.available) return;
-    usage.observe(rateLimits);
-    const event = store.append(terminal.sessionId, terminal.id, {
+    if (windows.length && heard !== continued.quota) {
+      continued.quota = heard;
+      quotas.observeTerminal(windows);
+    }
+    const shown = context
+      ? JSON.stringify([context.model, context.usedTokens, context.windowTokens])
+      : undefined;
+    if (!context || shown === continued.context) return;
+    continued.context = shown;
+    record(terminal.sessionId, terminal.id, {
       type: 'native.metrics',
-      context: context ?? last?.context ?? null,
-      usage: last?.usage ?? null,
-      rateLimits,
+      context,
+      usage: store.lastMetrics(terminal.sessionId)?.usage ?? null,
     });
-    broadcast({ type: 'session.event', event });
   }
   // A turn the user interrupts runs no hook and leaves nothing in the CLI's record (CLI 2.1.293). A key that
   // interrupts it, typed while the CLI works, with no hook after it in a while, is taken for the end of the turn:
@@ -1359,6 +1446,7 @@ export function createProxyServer(options: ServerOptions) {
         before,
       );
       broadcast({ type: 'session.updated', session: created });
+      announceProjects();
       return created.id;
     } catch (error) {
       if (error instanceof DomainError) throw error;
@@ -1423,6 +1511,7 @@ export function createProxyServer(options: ServerOptions) {
       toolFinished: false,
       approvals: new Map(),
       questions: new Set(),
+      plans: new Set(),
       answered: new Set(),
       controls: {},
       stats: inOrder(),
@@ -1449,6 +1538,7 @@ export function createProxyServer(options: ServerOptions) {
             {
               stepMs: options.stepMs ?? 110,
               projectPath: () => store.get(run.sessionId).session.projectPath,
+              permissionMode: () => store.get(run.sessionId).session.permissionMode,
               emit: (payload) => emit(run, payload),
               finish: (status, reason) => finish(run, status, reason),
             },
@@ -1468,6 +1558,16 @@ export function createProxyServer(options: ServerOptions) {
     }
     if (command.type === 'approval.reply' && run.answered.has(command.approvalId))
       throw new DomainError('approval_answered', '这一项已经处理过了，可能是在另一台设备上。');
+    // A mode, a changed plan or feedback is an answer to Claude's plan only: an approval of anything else does not
+    // change the mode by it.
+    if (
+      command.type === 'approval.reply' &&
+      command.plan &&
+      !(options.claude
+        ? run.plans.has(command.approvalId)
+        : run.planApproval === command.approvalId)
+    )
+      throw new DomainError('approval_invalid', '只有 Claude 的计划可以选择执行方式。');
     if (command.type === 'run.task.stop') {
       if (!run.controls.stopTask) return;
       // The CLI reports the task gone through its task list; a task already over is not an error.
@@ -1506,6 +1606,7 @@ export function createProxyServer(options: ServerOptions) {
           command.answers,
           skipped ? 'skipped' : undefined,
           peer.id,
+          command.plan,
         )
       )
         throw new DomainError('approval_inactive', '审批已失效。');
@@ -1516,9 +1617,14 @@ export function createProxyServer(options: ServerOptions) {
     const decide = run.decide;
     run.decide = undefined;
     run.answered.add(command.approvalId);
-    decide(command.allowed, command.answers);
+    decide(command.allowed, command.answers, command.plan);
   }
 
+  // What the record keeps of a plan approved: the mode it was carried out in, and whether the user changed it.
+  function planned(allowed: boolean, plan?: PlanDecision) {
+    if (!allowed || !plan) return {};
+    return { ...(plan.mode ? { mode: plan.mode } : {}), ...(plan.edited ? { edited: true } : {}) };
+  }
   function answerApproval(
     run: Run,
     approvalId: string,
@@ -1526,12 +1632,13 @@ export function createProxyServer(options: ServerOptions) {
     answers: Record<string, string> | undefined,
     unanswered: Unanswered | undefined,
     connectionId = run.connectionId,
+    plan?: PlanDecision,
   ) {
     const decide = run.approvals.get(approvalId);
     if (!decide) return false;
     run.approvals.delete(approvalId);
     run.answered.add(approvalId);
-    decide(allowed, answers, unanswered);
+    decide(allowed, answers, unanswered, plan);
     if (!run.approvals.size) emit(run, { type: 'run.status', status: 'running', connectionId });
     return true;
   }
@@ -1668,18 +1775,34 @@ export function createProxyServer(options: ServerOptions) {
           throw new DomainError('session_busy', '会话正在更新，请稍后重试。');
         for (const session of store.moveProject(command.from, command.to, deviceOf(peer)))
           broadcast({ type: 'session.updated', session });
+        announceProjects();
         return undefined;
       }
+      case 'project.add':
+        store.register(deviceOf(peer), command.path, command.name);
+        announceProjects();
+        return undefined;
+      case 'project.remove':
+        store.unregister(command.deviceId ?? deviceOf(peer).id, command.path);
+        announceProjects();
+        return undefined;
+      case 'project.rename':
+        store.renameProject(command.deviceId ?? deviceOf(peer).id, command.path, command.name);
+        announceProjects();
+        return undefined;
       case 'session.create': {
+        const device = destination(peer, command);
         const session = store.create(
           command.requestId,
           command.title,
           command.projectPath,
-          deviceOf(peer),
+          device,
+          command.plain && device === peer.device,
         );
         peer.subscriptions.clear();
         peer.subscriptions.add(session.id);
         broadcast({ type: 'session.updated', session });
+        announceProjects();
         return session.id;
       }
     }
@@ -1776,12 +1899,17 @@ export function createProxyServer(options: ServerOptions) {
           ),
         });
         break;
-      case 'session.move':
+      case 'session.move': {
+        const device = destination(peer, command);
+        if (session.activeRun && session.device?.id !== device.id)
+          throw new DomainError('run_active', '请先结束当前运行再把会话移到另一台电脑。');
         broadcast({
           type: 'session.updated',
-          session: store.move(command.sessionId, command.projectPath, deviceOf(peer)),
+          session: store.move(command.sessionId, command.projectPath, device),
         });
+        announceProjects();
         break;
+      }
       case 'session.delete':
       case 'session.rename':
         await manageSession(command, session);
@@ -1822,7 +1950,9 @@ export function createProxyServer(options: ServerOptions) {
         model: options.claude?.model,
         version,
         sessions: store.list(),
+        projects: store.projects(),
         historyId: store.historyId,
+        quota: quotas.current(),
         browser: {
           sessionId: peer.browser,
           serverDeviceId: serverDevice.id,
@@ -1878,7 +2008,10 @@ export function createProxyServer(options: ServerOptions) {
       update: updates?.state,
       client: installer(),
       sessions: store.list(),
+      projects: store.projects(),
       historyId: store.historyId,
+      quota: quotas.current(),
+      ...(files?.state && auth.data.tunnel && options.tunnel ? { files: files.state } : {}),
     });
     send(peer, devices());
     // Every connection that asks has an execution channel of its own, to the computer it comes from.
@@ -1938,6 +2071,43 @@ export function createProxyServer(options: ServerOptions) {
     }
     return true;
   }
+  // A connection for the file panel, signed in with the secret of its control connection's execution channel.
+  // Like a channel it is no peer: it carries one SSH connection, served by `files`, and ends with its owner.
+  function attachFiles(peer: Peer, value: unknown) {
+    const attach = filesAttachSchema.safeParse(value);
+    const owner = attach.success
+      ? [...peers].find((other) => other.authenticated && other.id === attach.data.connectionId)
+      : undefined;
+    if (!attach.success || !owner?.tunnel || !files?.state) {
+      peer.socket.close(TUNNEL_CLOSE.unknown, 'Unknown tunnel');
+      return false;
+    }
+    if (!owner.tunnel.matches(attach.data.secret)) {
+      refuse(peer.address, 'tunnel secret');
+      peer.socket.close(TUNNEL_CLOSE.refused, 'Unauthorized');
+      return false;
+    }
+    const open = fileConnections.get(owner.id) ?? new Set<WebSocket>();
+    if (open.size >= 4) {
+      peer.socket.close(TUNNEL_CLOSE.unknown, 'Too many file connections');
+      return false;
+    }
+    fileConnections.set(owner.id, open);
+    open.add(peer.socket);
+    peer.socket.once('close', () => open.delete(peer.socket));
+    peers.delete(peer);
+    peer.socket.removeAllListeners('message');
+    const stream = createWebSocketStream(peer.socket);
+    stream.on('error', () => peer.socket.terminate());
+    files.serve(stream, (target) => {
+      if (target === 'server') return files.ownServer();
+      const ssh = seats.get(target)?.door;
+      return ssh?.ready && ssh.ssh
+        ? [program('ssh'), '-F', ssh.ssh.configPath, '-s', 'device', 'sftp']
+        : undefined;
+    });
+    return true;
+  }
   function registerTunnel(peer: Peer, credentials: TunnelCredentials) {
     if (!peer.tunnel || peer.registering || credentials.connectionId !== peer.id) {
       peer.socket.close(4002, 'Inactive tunnel registration');
@@ -1954,14 +2124,13 @@ export function createProxyServer(options: ServerOptions) {
         .then(() => {
           send(peer, { type: 'tunnel.ready', connectionId: peer.id });
         })
-        .catch(() => {
+        .catch((error: unknown) => {
+          // What the device or ssh answered, which tells why: the user is shown it rather than a guess.
+          const said = error instanceof ProbeFailure ? error.message : '';
           send(peer, {
             type: 'connection.error',
             code: 'ssh_failed',
-            message:
-              platformOf(peer.device) === 'win32'
-                ? '服务端经隧道连不上本机的 SSH 服务。\n隧道已经建立，但探测命令没有得到应答：常见于安全软件拦截了内置的 sshd.exe 或 PowerShell，请检查保护记录后重新连接。'
-                : '服务端经隧道连不上本机的 SSH 服务。\n隧道已经建立，但探测命令没有得到应答：请重新连接；反复出现时在“设置 → 关于与更新”里打开连接日志查看原因。',
+            message: `隧道已建立，但本机 SSH 服务没有执行探测命令。${said ? `\n本机答复：${said}` : ''}`,
           });
           peer.socket.close(4003, 'SSH probe failed');
         }),
@@ -2112,6 +2281,8 @@ export function createProxyServer(options: ServerOptions) {
       }
     }
     if (peer.tunnel) track(peer.tunnel.close(), tunnelTasks);
+    for (const socket of fileConnections.get(peer.id) ?? []) socket.terminate();
+    fileConnections.delete(peer.id);
     announce();
   }
 
@@ -2186,9 +2357,14 @@ export function createProxyServer(options: ServerOptions) {
           // Only the first frame signs in. What a refused client sent after it is not another attempt.
           if (greeted) return;
           greeted = true;
-          const channel =
-            !peer.browser && (value as { type?: unknown } | null)?.type === 'tunnel.attach';
-          if (channel ? attachChannel(peer, value) : authenticate(peer, value)) {
+          const kind = !peer.browser && (value as { type?: unknown } | null)?.type;
+          if (
+            kind === 'tunnel.attach'
+              ? attachChannel(peer, value)
+              : kind === 'files.attach'
+                ? attachFiles(peer, value)
+                : authenticate(peer, value)
+          ) {
             clearTimeout(authTimer);
             signedIn = true;
             gate.leave(address);
@@ -2238,6 +2414,7 @@ export function createProxyServer(options: ServerOptions) {
             );
           for (const session of store.named(peer.device))
             broadcast({ type: 'session.updated', session });
+          announceProjects();
           enter(peer);
           announce();
           track(adopt(peer), tunnelTasks);
@@ -2306,6 +2483,7 @@ export function createProxyServer(options: ServerOptions) {
     store,
     async listen(port = 8787): Promise<string> {
       await releases.refresh();
+      await files?.start();
       updates?.start();
       if (usageReceiver)
         options.claude!.environment = telemetryEnvironment(await usageReceiver.listen());
@@ -2336,6 +2514,8 @@ export function createProxyServer(options: ServerOptions) {
         ...[...seats.values()].map((seat) => seat.door?.close()),
       ];
       for (const peer of peers) peer.socket.terminate();
+      for (const open of fileConnections.values()) for (const socket of open) socket.terminate();
+      files?.close();
       await Promise.all([...tasks]);
       await terminalCleanup;
       await Promise.all([...tunnelTasks]);

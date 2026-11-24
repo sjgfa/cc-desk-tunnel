@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
 import {
   chmodSync,
+  existsSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -473,7 +474,13 @@ test('ccdt’s settings: its own waits, the service’s and Claude Code’s with
   const config = new Config({ cli: join(root, 'cli'), desktop: join(root, 'desktop') });
   const remote = {
     compaction: { enabled: false, afterMinutes: 50, minTokens: 100_000 },
-    cli: { autoCompactEnabled: null, autoCompactWindow: 250_000, fallbackModel: ['sonnet'] },
+    cli: {
+      autoCompactEnabled: null,
+      autoCompactWindow: 250_000,
+      fastMode: null,
+      fallbackModel: ['sonnet'],
+      toolSearch: null,
+    },
     web: { enabled: true, url: 'https://work.example.com/desk/' },
   };
   const list = entries({ waits: { ssh: 20 }, ...remote });
@@ -489,15 +496,19 @@ test('ccdt’s settings: its own waits, the service’s and Claude Code’s with
   assert.equal(shown(named('compaction.enabled')), '关闭');
   assert.equal(shown(named('compaction.minTokens')), '100K tokens');
   assert.equal(shown(named('web.enabled')), '开启');
-  assert.equal(shown(named('cli.autoCompactEnabled')), '默认');
+  assert.equal(shown(named('cli.autoCompactEnabled')), '默认（开启）');
+  assert.equal(shown(named('cli.fastMode')), '默认（关闭）');
+  assert.equal(shown(named('cli.toolSearch')), '默认（自动）');
   // A value set by hand that is not among the choices is still one of them.
   assert.equal(shown(named('cli.autoCompactWindow')), '250K tokens');
   assert.equal(shown(named('cli.fallbackModel')), 'sonnet');
   assert.equal(shown(named('cli.instructions')), '暂不支持');
-  assert.deepEqual(
-    choices(named('cli.autoCompactEnabled')).map(([value]) => value),
-    [null, true, false],
-  );
+  assert.deepEqual(choices(named('cli.autoCompactEnabled')), [
+    [null, '默认（开启）'],
+    [true, '开启'],
+    [false, '关闭'],
+  ]);
+  assert.deepEqual(choices(named('cli.fastMode'))[0], [null, '默认（关闭）']);
   // What is written on the command line, in either language, and what will not do.
   assert.equal(parse(named('compaction.enabled'), 'on'), true);
   assert.equal(parse(named('cli.autoCompactEnabled'), '关闭'), false);
@@ -571,4 +582,102 @@ test('ccdt offers the shell Claude should prefer on Windows, Git Bash once the c
     { type: 'device.shell', shell: 'bash' },
     { type: 'device.shell', shell: null },
   ]);
+});
+
+// A stand-in connection to the service: its channel fails to get ready unless `ready`; `drop` loses it.
+function standIn(ready = true) {
+  let ended;
+  const service = {
+    ended: false,
+    closed: new Promise((resolve) => (ended = resolve)),
+    channel: async () => {
+      if (!ready) throw new Error('本机的执行通道没有就绪。');
+    },
+    drop: () => {
+      service.ended = true;
+      ended();
+    },
+    close: async () => service.drop(),
+  };
+  return service;
+}
+const settle = () => new Promise((resolve) => setTimeout(resolve, 20));
+async function online(connect) {
+  const { stayOnline } = await import('../src/online.mjs');
+  const said = [];
+  const marked = [];
+  let stop;
+  const done = stayOnline({
+    connect,
+    say: (line) => said.push(line),
+    mark: (on) => marked.push(on),
+    stop: new Promise((resolve) => (stop = resolve)),
+    wait: async () => {},
+    now: () => ({ toLocaleString: () => 'T' }),
+  });
+  return { said, marked, stop: () => stop(), done };
+}
+
+test('ccdt online stays online without a terminal, signing in again after a loss until it is stopped', async () => {
+  const given = [standIn(), standIn()];
+  const asked = [];
+  const run = await online(async (again) => {
+    asked.push(again);
+    // The network is away at the first try after the loss.
+    if (asked.length === 2) throw new Error('连接失败。');
+    return given[asked.length === 1 ? 0 : 1];
+  });
+  await settle();
+  const here = /^T 已在线：Claude 可以在这台电脑（.+）上执行命令。$/;
+  assert.match(run.said[0], here);
+  given[0].drop();
+  await settle();
+  // Signed in again quietly, after the failed try.
+  assert.deepEqual(asked, [false, true, true]);
+  assert.equal(run.said[1], 'T 连接断开，正在重连……');
+  assert.match(run.said[2], here);
+  run.stop();
+  assert.equal(await run.done, 0);
+  assert.equal(given[1].ended, true);
+  assert.equal(run.said.length, 3);
+  // Said online while it was, for the windows of ccdt to use its channel.
+  assert.deepEqual(run.marked, [true, false, true, false]);
+});
+
+test('ccdt online ends on a refused token, and where the channel does not get ready', async () => {
+  const lost = standIn();
+  const refused = await online(async (again) => {
+    if (!again) return lost;
+    throw Object.assign(new Error('服务凭据不正确。'), { code: 'unauthorized' });
+  });
+  await settle();
+  lost.drop();
+  await assert.rejects(refused.done, /服务凭据不正确/);
+  const stuck = standIn(false);
+  const unready = await online(async () => stuck);
+  await assert.rejects(unready.done, /执行通道没有就绪/);
+  assert.equal(stuck.ended, true);
+});
+
+test('a window of ccdt uses the channel of ccdt online while that runs, for the same service alone', async (t) => {
+  const { markOnline, onlineAt } = await import('../src/online.mjs');
+  const directory = mkdtempSync(join(tmpdir(), 'ccdt-online-'));
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  const path = join(directory, 'online.json');
+  const url = 'wss://example.invalid/ws';
+  assert.equal(onlineAt(path, url), false);
+  const mark = markOnline(path, url);
+  mark(true);
+  assert.equal(onlineAt(path, url), true);
+  assert.equal(onlineAt(path, 'wss://other.invalid/ws'), false);
+  mark(false);
+  assert.equal(onlineAt(path, url), false);
+  // A process that is gone, and another's mark, which this one leaves alone.
+  const gone = spawnSync(process.execPath, ['-e', 'console.log(process.pid)'], {
+    encoding: 'utf8',
+  });
+  markOnline(path, url, Number(gone.stdout.trim()))(true);
+  assert.equal(onlineAt(path, url), false);
+  mark(false);
+  assert.equal(existsSync(path), true);
 });

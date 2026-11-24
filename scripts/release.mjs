@@ -3,6 +3,7 @@ import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { releaseFiles } from './release-manifest.mjs';
+import { helpAnchors } from './help-anchors.mjs';
 
 // Releases the version in apps/desktop/package.json from what the main branch on GitHub holds. Nothing is
 // built on this computer: the `package` workflow on GitHub builds every file from that commit, starts each
@@ -34,6 +35,42 @@ const section = new RegExp(
   .exec(readFileSync(join(root, 'CHANGELOG.md'), 'utf8'))?.[1]
   .trim();
 if (!section) throw new Error(`CHANGELOG.md has no section "## ${version}".`);
+// The help marks what a version brought and makes its page of what is new from those marks (help-content.ts).
+if (
+  !readFileSync(join(root, 'apps/desktop/src/help-content.ts'), 'utf8').includes(
+    `since: '${version}'`,
+  )
+)
+  console.log(
+    `Note: the help marks nothing as new in ${version}. If it brings features, write how to use them in apps/desktop/src/help-content.ts and mark them with since: '${version}'.`,
+  );
+// The help's articles that changed parts of the window point to, since the last release: their text may need to follow.
+// Only what changed is named, so a release that touches none of them says nothing.
+try {
+  const last = git('describe', '--tags', '--abbrev=0', '--match', 'v*', 'HEAD');
+  const changed = git('diff', '--name-only', `${last}..HEAD`, '--', 'apps/desktop/src')
+    .split('\n')
+    .filter((file) => file && !file.endsWith('help-content.ts'));
+  const pointed = [
+    ...new Set(
+      changed.flatMap((file) => {
+        try {
+          return helpAnchors(readFileSync(join(root, file), 'utf8'))
+            .map((anchor) => anchor.split('#')[0])
+            .filter((id) => id !== 'whats-new');
+        } catch {
+          return [];
+        }
+      }),
+    ),
+  ];
+  if (pointed.length)
+    console.log(
+      `Note: since ${last}, changed files point to these help articles; check they still match: ${pointed.join(', ')}.`,
+    );
+} catch {
+  // No earlier release to compare with.
+}
 // The section's GitHub alerts (`> [!WARNING]` and the like) are what a reader must see before upgrading: they open
 // the notes, above how to download, in the colours GitHub gives them.
 const alert = /^> \[!(?:NOTE|TIP|IMPORTANT|WARNING|CAUTION)\]\n(?:>.*(?:\n|$))*/gm;
@@ -64,7 +101,7 @@ const notes = [
   ...alerts.flatMap((block) => [block, '']),
   '## 下载与升级',
   '',
-  '客户端有两种，可以只装一种，也可以都装，都要与服务端同一版本：**图形客户端**是桌面应用；**终端客户端 `ccdt`** 在自己的终端里使用原版 Claude Code，与图形客户端共用会话。',
+  '**图形客户端**是桌面应用，自带终端客户端 `ccdt`；只用终端时（例如没有图形界面的机器）单独下载 `ccdt`。`ccdt` 在自己的终端里使用原版 Claude Code，与图形客户端共用会话。都要与服务端同一版本。',
   '',
   '| | Windows | macOS（实验性） | Linux（实验性） |',
   '| --- | --- | --- | --- |',
@@ -83,13 +120,13 @@ const notes = [
   `curl -fsSL ${raw}/install-ccdt.sh | sh`,
   '```',
   '',
-  '- **已在使用**：在图形客户端的“设置 → 关于与更新”里先升级服务端，再按提示升级客户端；`ccdt` 运行 `ccdt upgrade`，服务端与它自己一起升级。',
+  '- **已在使用**：在图形客户端的“设置 → 关于与更新”里先升级服务端，再按提示升级客户端；图形客户端自带的 `ccdt` 随它升级；单独安装的 `ccdt` 运行 `ccdt upgrade`，服务端与它自己一起升级。',
   `- **新部署服务端**：在服务器上用一条命令安装，见[快速开始](${repository}#快速开始)；镜像为 \`ghcr.io/sun168567/cc-desk-tunnel:${version}\`，${link('服务端程序包', server)}是安装和升级时下载的。`,
-  `- **校验**：${link('SHA256SUMS', 'SHA256SUMS')} · ${link('release.json', 'release.json')}。Windows 安装包没有代码签名，SmartScreen 与杀毒软件的提示见[说明](${repository}#杀毒软件与-smartscreen)。`,
+  `- **校验**：${link('SHA256SUMS', 'SHA256SUMS')} · ${link('release.json', 'release.json')}。Windows 安装包没有代码签名，SmartScreen 与杀毒软件的提示见[说明](${repository}/blob/main/docs/troubleshooting.md#杀毒软件与-smartscreen)。`,
   '',
   '---',
   '',
-  '> 用桌面客户端驱动云端的 Claude Code，经反向隧道在你自己的电脑上执行。',
+  '> 在一台服务器上集中运行 Claude Code，让它在你的多台电脑上执行开发和操作，无公网的机器也能连入；会话在桌面、手机和终端之间共用。',
   '',
   // The change log links to files beside it; on the release page those links need the whole address.
   body

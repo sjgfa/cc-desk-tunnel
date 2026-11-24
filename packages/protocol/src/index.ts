@@ -4,7 +4,7 @@ import { webCertificateStateSchema } from './web-certificate.ts';
 export * from './web.ts';
 export * from './web-certificate.ts';
 
-export const PROTOCOL_VERSION = 27;
+export const PROTOCOL_VERSION = 29;
 // The release each protocol version began with, from 0.2.4 on: a client newer than its service signs in with
 // the service's number to have it upgrade (see the README). A new number adds its line here.
 export const PROTOCOL_HISTORY: Readonly<Record<string, number>> = {
@@ -26,10 +26,14 @@ export const PROTOCOL_HISTORY: Readonly<Record<string, number>> = {
   '0.3.14': 25,
   '0.3.15': 26,
   '0.3.16': 27,
+  '0.3.17': 28,
+  '0.3.18': 29,
 };
 export const MAX_FRAME_BYTES = 256 * 1024;
 // The longest global instructions edited here, in characters; it keeps a frame of them within MAX_FRAME_BYTES.
 export const INSTRUCTIONS_LIMIT = 64_000;
+// The longest plan the user may hand back edited, or feedback on one, in characters; within MAX_FRAME_BYTES too.
+export const PLAN_LIMIT = 60_000;
 const id = z.uuid();
 // A path tells its own system: a Windows one begins with a drive letter or two backslashes, anything else is
 // a POSIX one. Sessions of both kinds can be in one list, each from the computer it is on.
@@ -57,6 +61,10 @@ export const permissionModeSchema = z.enum([
   'bypassPermissions',
 ]);
 export type PermissionMode = z.infer<typeof permissionModeSchema>;
+// The modes a plan may be carried out in once approved, as Claude Code's own plan approval offers them; the mode
+// that asks about nothing is not among them, as a run must start in it to have it.
+export const planModeSchema = z.enum(['auto', 'acceptEdits', 'default']);
+export type PlanMode = z.infer<typeof planModeSchema>;
 export const effortSchema = z.enum(['low', 'medium', 'high', 'xhigh', 'max']);
 export type Effort = z.infer<typeof effortSchema>;
 export const modelInfoSchema = z.object({
@@ -182,6 +190,13 @@ export const rateLimitsSchema = z.object({
   ),
   measuredAt: timestamp.optional(),
 });
+// The plan quota of the account the service runs Claude Code under, as the service holds it (see `Quotas`): the
+// account's, not a session's. `error` says why the service's last read of it failed; the reading kept says how old it is.
+export const accountQuotaSchema = z.object({
+  rateLimits: rateLimitsSchema.nullable(),
+  error: z.string().optional(),
+});
+export type AccountQuota = z.infer<typeof accountQuotaSchema>;
 const usageTotals = {
   requests: z.number().int().nonnegative(),
   inputTokens: z.number().nonnegative(),
@@ -264,7 +279,7 @@ export type TerminalActivity = z.infer<typeof terminalActivitySchema>;
 export const terminalStatuses = new Set<RunStatus>(['completed', 'cancelled', 'failed']);
 export type RunStatus = z.infer<typeof runStatusSchema>;
 
-const scenarioSchema = z.enum(['chat', 'tool', 'question', 'error']);
+const scenarioSchema = z.enum(['chat', 'tool', 'question', 'plan', 'error']);
 const toolSchema = z.object({
   toolId: z.string().min(1),
   name: z.string().min(1),
@@ -313,6 +328,9 @@ export const eventPayloadSchema = z.discriminatedUnion('type', [
     updatedAt: timestamp.optional(),
   }),
   z.object({ type: z.literal('native.notice'), text: z.string() }),
+  // The mode the CLI works in changed during the run: Claude entered plan mode by itself, or a plan was approved
+  // and the mode chosen for it took over. The session keeps it for the turns that follow.
+  z.object({ type: z.literal('native.mode'), permissionMode: permissionModeSchema }),
   // The background tasks alive in the run's CLI; each list replaces the one before.
   z.object({
     type: z.literal('native.tasks'),
@@ -339,11 +357,10 @@ export const eventPayloadSchema = z.discriminatedUnion('type', [
     type: z.literal('native.metrics'),
     context: contextUsageSchema.nullable(),
     usage: nativeUsageSchema.nullable(),
-    rateLimits: rateLimitsSchema.nullable(),
     // How long the prompt cache the turn wrote lasts, as its requests were billed; only on a turn's end, and only when
     // it wrote one.
     cacheTtl: z.enum(['5m', '1h']).optional(),
-    errors: z.object({ context: z.string().optional(), usage: z.string().optional() }).optional(),
+    errors: z.object({ context: z.string().optional() }).optional(),
   }),
   z.object({ type: z.literal('native.title'), title: z.string().min(1).max(120) }),
   z.object({
@@ -394,8 +411,23 @@ export const eventPayloadSchema = z.discriminatedUnion('type', [
     toolUses: z.number().int().nonnegative().optional(),
     summary: z.string().max(300).optional(),
   }),
-  z.object({ type: z.literal('approval.requested'), approvalId: id, toolId: z.string().min(1) }),
-  z.object({ type: z.literal('approval.resolved'), approvalId: id, allowed: z.boolean() }),
+  z.object({
+    type: z.literal('approval.requested'),
+    approvalId: id,
+    toolId: z.string().min(1),
+    // Why Claude Code asks, in its words; `safetyCheck` when one of its own safety checks asks, which it does in
+    // every mode, bypassing permissions too, and which no rule allows.
+    reason: z.string().max(4000).optional(),
+    safetyCheck: z.boolean().optional(),
+  }),
+  z.object({
+    type: z.literal('approval.resolved'),
+    approvalId: id,
+    allowed: z.boolean(),
+    // For a plan approved: the mode it is carried out in, and whether the user changed it first.
+    mode: planModeSchema.optional(),
+    edited: z.boolean().optional(),
+  }),
   z.object({
     type: z.literal('tool.result'),
     toolId: z.string().min(1),
@@ -472,6 +504,8 @@ export const sessionSchema = z.object({
   // the user's computers sends its messages. A session from before 0.2.11 has none until a computer sends it one.
   device: deviceSchema.optional(),
   permissionMode: permissionModeSchema.default('auto'),
+  // The mode the session was in before it went into plan mode, which a plan approved goes back to by default.
+  modeBeforePlan: planModeSchema.optional(),
   model: z.string().trim().min(1).max(200).nullable().default(null),
   effort: effortSchema.nullable().default(null),
   // The directory on the service that Claude Code works in, under its native/ folder: the one of the session's
@@ -516,6 +550,28 @@ export const sessionSchema = z.object({
     .nullable(),
 });
 export type Session = z.infer<typeof sessionSchema>;
+// A folder of one of the user's computers that the user keeps as a project. The service keeps the list, for every
+// client of every computer alike. A session belongs to the project its computer and folder name; a session whose
+// folder is no project is a plain one.
+export const projectSchema = z.object({
+  device: deviceSchema,
+  path: z.string().min(1).max(2048),
+  // What the user calls it; the folder's own name where it has none.
+  name: z.string().min(1).max(60).optional(),
+  // The directory on the service that Claude Code works in for it, under its native/ folder (see `nativeRoot`).
+  root: id,
+  createdAt: timestamp,
+});
+export type Project = z.infer<typeof projectSchema>;
+// Whether a folder of a computer is one of the projects.
+export const projectOf = (
+  projects: Project[],
+  deviceId: string | undefined,
+  path: string,
+): Project | undefined =>
+  projects.find(
+    (project) => project.device.id === deviceId && pathKey(project.path) === pathKey(path),
+  );
 // Whether a session's run is at work, so that the restart of a service upgrade would cut it off: a turn under way or
 // waiting on the user, or a terminal whose CLI works or waits. A terminal open at rest, and a turn ended but for the
 // background tasks it left, are not: an upgrade only ends them, and the session goes on after it.
@@ -564,12 +620,17 @@ export const commandSchema = z.discriminatedUnion('type', [
       title: z.string().trim().min(1).max(120),
     })
     .strict(),
+  // On the computer of this connection, whose folder becomes a project unless the session is `plain`, or on
+  // `deviceId`, another of the user's that is connected, in one of its projects.
   z
     .object({
       type: z.literal('session.create'),
       ...request,
       title: z.string().trim().min(1).max(120),
       projectPath: z.string().trim().min(1).max(2048),
+      deviceId: id.optional(),
+      // A session of no project, in a folder made for it alone.
+      plain: z.literal(true).optional(),
     })
     .strict(),
   z.object({ type: z.literal('account.status'), ...request }).strict(),
@@ -681,13 +742,16 @@ export const commandSchema = z.discriminatedUnion('type', [
       effort: effortSchema.nullable().optional(),
     })
     .strict(),
-  // Points a session at a project directory on the computer that asks, which the session is on from then.
+  // Points a session at a directory on the computer that asks, which the session is on from then and which becomes
+  // a project, or at a project of another connected computer (`deviceId`).
   z
     .object({
       type: z.literal('session.move'),
       ...request,
       sessionId: id,
       projectPath: z.string().trim().min(1).max(2048),
+      // As for `session.create`: to a project of another connected computer.
+      deviceId: id.optional(),
     })
     .strict(),
   // Points a project of the computer that asks at another directory there, with all its sessions; what Claude
@@ -698,6 +762,36 @@ export const commandSchema = z.discriminatedUnion('type', [
       ...request,
       from: z.string().trim().min(1).max(2048),
       to: z.string().trim().min(1).max(2048),
+    })
+    .strict(),
+  // Makes a folder of the computer that asks one of its projects, under `name` if one is given.
+  z
+    .object({
+      type: z.literal('project.add'),
+      ...request,
+      path: z.string().trim().min(1).max(2048),
+      name: z.string().trim().min(1).max(60).optional(),
+    })
+    .strict(),
+  // A project of the computer that asks, or of another of the user's (`deviceId`), connected or not. Removing one
+  // leaves the folder and its sessions where they are, plain sessions from then; what Claude Code keeps of it on
+  // the service stays too, for when the folder is a project again.
+  z
+    .object({
+      type: z.literal('project.remove'),
+      ...request,
+      deviceId: id.optional(),
+      path: z.string().trim().min(1).max(2048),
+    })
+    .strict(),
+  // An empty name gives the project back the folder's own.
+  z
+    .object({
+      type: z.literal('project.rename'),
+      ...request,
+      deviceId: id.optional(),
+      path: z.string().trim().min(1).max(2048),
+      name: z.string().trim().max(60),
     })
     .strict(),
   z.object({ type: z.literal('session.compact'), ...request, sessionId: id }).strict(),
@@ -801,6 +895,15 @@ export const commandSchema = z.discriminatedUnion('type', [
       allowed: z.boolean(),
       // The answers to a question Claude asked, keyed by the question's text.
       answers: z.record(z.string().max(2000), z.string().max(4000)).optional(),
+      // Only for Claude's plan: allowed, the mode to carry it out in and the plan as the user changed it; not
+      // allowed, what the user says to plan further by.
+      plan: z
+        .object({
+          mode: planModeSchema.optional(),
+          edited: z.string().trim().min(1).max(PLAN_LIMIT).optional(),
+          feedback: z.string().trim().max(PLAN_LIMIT).optional(),
+        })
+        .optional(),
     })
     .strict(),
 ]);
@@ -894,10 +997,24 @@ export const serverMessageSchema = z.discriminatedUnion('type', [
     // The newest Windows installer the service holds, for clients that want to upgrade themselves.
     client: installerSchema.optional(),
     sessions: z.array(sessionSchema),
+    projects: z.array(projectSchema),
     // Names the stored history: it changes when history is rewritten, and what a client kept of the old goes.
     // Without it a client keeps nothing.
     historyId: id.optional(),
     browser: z.object({ sessionId: id, serverDeviceId: id, selfSigned: z.boolean() }).optional(),
+    // The service's files, where the file panel can reach them (see `files.attach`): the data directory, whose
+    // `native/<root>` are the sessions' working directories, the home directory, and whether its secrets are kept
+    // out of reach (Landlock), which a service without it says so the panel can tell the user.
+    files: z
+      .object({
+        server: z.boolean(),
+        dataDir: z.string(),
+        home: z.string(),
+        protected: z.boolean(),
+      })
+      .optional(),
+    // The plan quota the service holds; every change to it follows as `quota`.
+    quota: accountQuotaSchema.optional(),
   }),
   z.object({
     type: z.literal('response'),
@@ -910,6 +1027,8 @@ export const serverMessageSchema = z.discriminatedUnion('type', [
   z.object({ type: z.literal('session.snapshot'), ...historyPageSchema.shape }),
   z.object({ type: z.literal('session.updated'), session: sessionSchema }),
   z.object({ type: z.literal('session.deleted'), sessionId: id }),
+  // The plan quota as the service now holds it, sent to every connection whenever it changes.
+  z.object({ type: z.literal('quota'), ...accountQuotaSchema.shape }),
   z.object({ type: z.literal('session.event'), event: eventSchema }),
   z.object({
     type: z.literal('session.fragment'),
@@ -950,6 +1069,8 @@ export const serverMessageSchema = z.discriminatedUnion('type', [
     modelMs: z.number().nonnegative(),
     ttftMs: z.number().nonnegative().nullable(),
     outputPerSecond: z.number().nonnegative().nullable(),
+    // The official CLI's API-price estimate, not a subscription bill.
+    costUsd: z.number().nonnegative(),
     // The oldest record the call log holds at all. The log is pruned, so a session older than this is counted from here.
     firstRecordAt: timestamp.nullable(),
   }),
@@ -1007,6 +1128,8 @@ export const serverMessageSchema = z.discriminatedUnion('type', [
       }),
     ),
   }),
+  // The projects of all the user's computers, sent on signing in (`ready`) and to every window whenever they change.
+  z.object({ type: z.literal('projects'), projects: z.array(projectSchema) }),
   // The execution channel runs over connections the device opens to this same address. `secret` signs them
   // in; it belongs to this connection alone and ends with it.
   z.object({ type: z.literal('tunnel.offer'), connectionId: id, secret: tunnelSecret }),
@@ -1029,6 +1152,16 @@ export const tunnelAttachSchema = z
 export type TunnelAttach = z.infer<typeof tunnelAttachSchema>;
 // How a channel connection is closed when it could not be attached.
 export const TUNNEL_CLOSE = { refused: 4001, unknown: 4004 } as const;
+
+// A connection for the file panel: signed in with the secret of the execution channel of the connection it
+// belongs to, it carries one SSH connection whose SFTP sessions reach the service's files and those of the
+// user's online computers. Each SFTP session names its computer in this environment variable: `server` for
+// the service, or a computer's ID.
+export const filesAttachSchema = z
+  .object({ type: z.literal('files.attach'), connectionId: id, secret: tunnelSecret })
+  .strict();
+export type FilesAttach = z.infer<typeof filesAttachSchema>;
+export const FILES_TARGET_ENV = 'CC_DESK_TUNNEL_FILES';
 
 export const tunnelCredentialsSchema = z
   .object({

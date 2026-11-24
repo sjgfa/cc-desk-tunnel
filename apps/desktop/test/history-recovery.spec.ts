@@ -82,9 +82,10 @@ test('stale tools stop spinning, stalled history can pause and retry without res
         return send({
           type: 'ready',
           protocolVersion: PROTOCOL_VERSION,
-          version: '0.3.16',
+          version: '0.3.19',
           adapter: 'simulation',
           connectionId,
+          projects: [],
           sessions: [session, other],
         });
       if (command.type === 'session.subscribe') {

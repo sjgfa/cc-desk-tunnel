@@ -4,7 +4,7 @@ import { randomUUID } from 'node:crypto';
 import { mkdirSync, rmSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { PROTOCOL_VERSION } from '@cc-desk-tunnel/protocol';
-import { connectionArgs, login, screenshots } from './helpers.ts';
+import { connectionArgs, signInWindow, screenshots } from './helpers.ts';
 
 const shots = resolve(screenshots, 'settings-layout');
 const every = [
@@ -18,7 +18,6 @@ const every = [
   '账号与额度',
   'CLI 设置',
   '全局说明',
-  '帮助',
   '关于与更新',
 ];
 
@@ -51,6 +50,7 @@ async function serve(page: Page, url: string, shells?: string[], chosen: unknown
           version: '0.0.1',
           connectionId: randomUUID(),
           adapter: 'claude-code',
+          projects: [],
           sessions: [],
         });
         return;
@@ -266,9 +266,11 @@ test('Electron: this computer’s settings as the desktop client shows them', as
     env,
   });
   try {
-    const page = await application.firstWindow();
-    await expect(page.getByRole('heading', { name: '连接代理服务', exact: true })).toBeVisible();
-    await login(page);
+    const launcher = await application.firstWindow();
+    await expect(
+      launcher.getByRole('heading', { name: '连接代理服务', exact: true }),
+    ).toBeVisible();
+    const page = await signInWindow(application);
     await picture(
       page,
       resolve(shots, 'desktop'),

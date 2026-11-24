@@ -3,8 +3,8 @@ import { onSharedChange, saveShared, shareOnce, shared } from './shared.ts';
 import { defaultView, viewModes } from './transcriptView.ts';
 import type { TranscriptView } from './transcriptView.ts';
 
-// Choices that belong to this computer and never reach the service: what is pinned, what a project is called
-// here, which events raise a notification, and the keyboard shortcuts. The windows of the computer's
+// Choices that belong to this computer and never reach the service: what is pinned and folded, which events raise
+// a notification, and the keyboard shortcuts. The windows of the computer's
 // connections share them (see shared.ts).
 export type NotifyKind = 'done' | 'failed' | 'approval' | 'question' | 'schedule' | 'connection';
 import { connectionWaits, waitRange } from './setting-fields.ts';
@@ -31,7 +31,6 @@ export type Prefs = {
   // the computer's id, a line break and the folder's pathKey(), and the sessions with no project by the
   // computer's id and a line break.
   collapsedElsewhere: string[];
-  projectNames: Record<string, string>;
   notify: { enabled: boolean; sound: boolean } & Record<NotifyKind, boolean>;
   // `keys` holds only what the user changed, by action; an empty combination means none.
   shortcuts: { enabled: boolean; keys: Record<string, string> };
@@ -51,6 +50,8 @@ export type Prefs = {
   // The strip under the input box with the whole session's figures; chosen the same way.
   sessionBar: { enabled: boolean; summary: Record<string, boolean> };
   theme: Theme;
+  // The file panel beside the conversation: whether it is open, and how wide the user made it.
+  filePanel: { open: boolean; width: number };
 };
 
 const storageKey = 'proxy-prefs';
@@ -60,7 +61,6 @@ const defaults: Prefs = {
   collapsedProjects: [],
   elsewhereOpen: false,
   collapsedElsewhere: [],
-  projectNames: {},
   notify: {
     enabled: true,
     sound: true,
@@ -80,6 +80,7 @@ const defaults: Prefs = {
   view: defaultView,
   sessionBar: { enabled: false, summary: {} },
   theme: 'system',
+  filePanel: { open: false, width: 420 },
 };
 
 function stored(): unknown {
@@ -100,8 +101,6 @@ function read(saved: any = shared('prefs') ?? stored()): Prefs {
       collapsedProjects: strings(saved.collapsedProjects),
       elsewhereOpen: saved.elsewhereOpen === true,
       collapsedElsewhere: strings(saved.collapsedElsewhere),
-      projectNames:
-        saved.projectNames && typeof saved.projectNames === 'object' ? saved.projectNames : {},
       notify: { ...defaults.notify, ...(typeof saved.notify === 'object' ? saved.notify : {}) },
       shortcuts: {
         enabled: saved.shortcuts?.enabled !== false,
@@ -145,6 +144,13 @@ function read(saved: any = shared('prefs') ?? stored()): Prefs {
         ),
       },
       theme: themes.find((entry) => entry.theme === saved.theme)?.theme ?? defaults.theme,
+      filePanel: {
+        open: saved.filePanel?.open === true,
+        width:
+          Number.isFinite(saved.filePanel?.width) && saved.filePanel.width >= 280
+            ? Math.min(saved.filePanel.width, 3000)
+            : defaults.filePanel.width,
+      },
     };
   } catch {
     return defaults;

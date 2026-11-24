@@ -14,8 +14,9 @@ import type {
   Device,
   IdleCompaction,
   NativeCapabilities,
-  NativeMetrics,
+  AccountQuota,
   ServerMessage,
+  Project,
   ServiceUpdate,
   Session,
   SessionEvent,
@@ -137,10 +138,14 @@ export type ClientState = {
   // The computer this client signed in as; a session's commands run on the one it is on.
   device: Device | null;
   browser: Extract<ServerMessage, { type: 'ready' }>['browser'] | null;
+  // The service's files as the file panel reaches them, where it offers them (see FilePanel.tsx).
+  files: NonNullable<Extract<ServerMessage, { type: 'ready' }>['files']> | null;
   // The user's computers connected to the service now, and whether commands reach each yet. Another
   // computer's sessions can be worked on from here while it is listed and ready.
   devices: ConnectedDevice[];
   sessions: Session[];
+  // The projects of all the user's computers, as the service keeps them.
+  projects: Project[];
   events: Record<string, SessionEvent[]>;
   // Output a run is in the middle of, as far as it has arrived. It has no place in the history yet: the
   // event that records it takes its place.
@@ -160,9 +165,11 @@ export type ClientState = {
   // still fetching it.
   preparing: number | null;
   model: string | null;
-  // The latest native readings from any session, for views that are not tied to the selected one.
+  // The latest capabilities from any session, for views that are not tied to the selected one.
   capabilities: NativeCapabilities | null;
-  metrics: NativeMetrics | null;
+  // The plan quota the service holds for its account, as `ready` and each `quota` since gave it. It is the
+  // account's: no session's events carry it. Kept while disconnected, as the last reading.
+  quota: AccountQuota | null;
   account: AccountState | null;
   // A newly generated token is held only until its one-time dialog closes or this connection ends.
   setupToken: SetupTokenResult | null;
@@ -185,8 +192,10 @@ export class ProxyClient {
     connectionId: null,
     device: null,
     browser: null,
+    files: null,
     devices: [],
     sessions: [],
+    projects: [],
     events: {},
     live: {},
     history: {},
@@ -200,7 +209,7 @@ export class ProxyClient {
     preparing: null,
     model: null,
     capabilities: null,
-    metrics: null,
+    quota: null,
     account: null,
     setupToken: null,
     compaction: null,
@@ -303,6 +312,7 @@ export class ProxyClient {
       status: 'connecting',
       device,
       browser: null,
+      files: null,
       devices: [],
       error: null,
       release: null,
@@ -316,7 +326,7 @@ export class ProxyClient {
       history: {},
       selectedId: null,
       capabilities: null,
-      metrics: null,
+      quota: null,
       account: null,
       compaction: null,
     });
@@ -350,6 +360,7 @@ export class ProxyClient {
       status: 'connecting',
       device: null,
       browser: null,
+      files: null,
       devices: [],
       error: null,
       sessions: [],
@@ -547,7 +558,9 @@ export class ProxyClient {
           listeningId: null,
           connectionId: message.connectionId,
           browser: message.browser ?? null,
+          files: message.files ?? null,
           sessions: message.sessions,
+          projects: message.projects,
           selectedId,
           error: null,
           adapter: message.adapter,
@@ -555,6 +568,7 @@ export class ProxyClient {
           service: message.version,
           update: message.update ?? null,
           model: message.model ?? null,
+          quota: message.quota ?? null,
         });
         if (message.historyId) {
           this.disk.use(message.historyId);
@@ -637,11 +651,14 @@ export class ProxyClient {
       } else if (message.type === 'account.state') {
         const { type: _type, ...account } = message;
         // A signed-out account must not keep showing the previous one's identity and quota.
-        this.update(
-          account.loggedIn ? { account } : { account, capabilities: null, metrics: null },
-        );
+        this.update(account.loggedIn ? { account } : { account, capabilities: null, quota: null });
+      } else if (message.type === 'quota') {
+        const { type: _type, ...quota } = message;
+        this.update({ quota });
       } else if (message.type === 'devices') {
         this.update({ devices: message.devices });
+      } else if (message.type === 'projects') {
+        this.update({ projects: message.projects });
       } else if (message.type === 'session.deleted') {
         this.disk.drop(message.sessionId);
         const events = { ...this.state.events };
@@ -717,10 +734,8 @@ export class ProxyClient {
         if (!['native.metrics', 'native.capabilities', 'native.context'].includes(payload.type))
           this.activity.set(message.event.sessionId, at);
         if (payload.type === 'native.capabilities') this.update({ capabilities: payload });
-        if (payload.type === 'native.metrics') this.update({ metrics: payload });
-        // The service streams the shown session's events, and only some events of the others (a terminal's quota goes
-        // to every connection): one of those in a cached history would move its cursor past what was never received,
-        // and showing that session again would not fetch it.
+        // The service streams the shown session's events, and may send some of another one's: one of those in a cached
+        // history would move its cursor past what was never received, and showing that session again would not fetch it.
         if (message.event.sessionId !== this.state.selectedId) return;
         this.streamEvents.push(message.event);
         this.streamTimer ??= setTimeout(() => this.flushStream(), 32);

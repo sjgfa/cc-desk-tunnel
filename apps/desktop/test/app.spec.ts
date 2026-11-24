@@ -4,17 +4,28 @@ import {
   connection,
   connectionArgs,
   connectionDirectory,
+  connectionWindow,
   createSession,
+  endStrays,
   expandActivity,
   login,
   screenshots,
   search,
+  signInWindow,
   send,
   sessionAction,
   settled,
 } from './helpers.ts';
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import {
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from 'node:fs';
 import { resolve } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 
@@ -179,34 +190,46 @@ test('Electron loads the built UI with sandbox and closes its execution connecti
   const env: Record<string, string> = {};
   for (const [name, value] of Object.entries(process.env))
     if (value !== undefined && name !== 'ELECTRON_RUN_AS_NODE') env[name] = value;
+  const profile = resolve('.local/ui-test/profile-smoke');
+  const args = connectionArgs(profile, true);
+  // As 0.3.17 left it: one project list for all the computer's connections, the names with the preferences.
+  const legacy = 'D:\\工作\\升级前的项目';
+  writeFileSync(resolve(profile, 'shared', 'projects.json'), JSON.stringify([legacy]));
+  writeFileSync(
+    resolve(profile, 'shared', 'prefs.json'),
+    JSON.stringify({ projectNames: { [legacy.toLowerCase()]: '升级前的名字' } }),
+  );
   const application = await _electron.launch({
-    args: [
-      resolve('apps/desktop'),
-      '--smoke-test',
-      ...connectionArgs(resolve('.local/ui-test/profile-smoke'), true),
-    ],
+    args: [resolve('apps/desktop'), '--smoke-test', ...args],
     env,
   });
   let sessionTitle = '';
   try {
-    const page = await application.firstWindow();
-    await expect(page.getByRole('heading', { name: '连接代理服务', exact: true })).toBeVisible();
-    const security = await application.evaluate(({ BrowserWindow }) => {
-      const contents = BrowserWindow.getAllWindows()[0].webContents as unknown as {
-        getLastWebPreferences: () => {
-          nodeIntegration: boolean;
-          contextIsolation: boolean;
-          sandbox: boolean;
-        };
-      };
-      const preferences = contents.getLastWebPreferences();
-      return {
-        nodeIntegration: preferences.nodeIntegration,
-        contextIsolation: preferences.contextIsolation,
-        sandbox: preferences.sandbox,
-      };
-    });
-    expect(security).toEqual({ nodeIntegration: false, contextIsolation: true, sandbox: true });
+    const launcher = await application.firstWindow();
+    await expect(
+      launcher.getByRole('heading', { name: '连接代理服务', exact: true }),
+    ).toBeVisible();
+    // The sign-in window and the connection's window alike.
+    const security = () =>
+      application.evaluate(({ BrowserWindow }) =>
+        BrowserWindow.getAllWindows().map((window) => {
+          const contents = window.webContents as unknown as {
+            getLastWebPreferences: () => {
+              nodeIntegration: boolean;
+              contextIsolation: boolean;
+              sandbox: boolean;
+            };
+          };
+          const preferences = contents.getLastWebPreferences();
+          return {
+            nodeIntegration: preferences.nodeIntegration,
+            contextIsolation: preferences.contextIsolation,
+            sandbox: preferences.sandbox,
+          };
+        }),
+      );
+    const safe = { nodeIntegration: false, contextIsolation: true, sandbox: true };
+    expect(await security()).toEqual([safe]);
     const documents = resolve('.local/ui-test/documents');
     rmSync(documents, { recursive: true, force: true });
     mkdirSync(documents, { recursive: true });
@@ -214,7 +237,16 @@ test('Electron loads the built UI with sandbox and closes its execution connecti
       ({ app }, directory) => app.setPath('documents', directory),
       documents,
     );
-    await login(page);
+    const page = await signInWindow(application);
+    // Its window is shown, and the sign-in window gone.
+    await expect.poll(security).toEqual([safe]);
+    // The connection hands the computer's old project list to its service, names and all, and the list goes.
+    await expect(
+      page.locator(`.project-group > h2[title="${legacy.replaceAll('\\', '\\\\')}"]`),
+    ).toContainText('升级前的名字');
+    await expect
+      .poll(() => existsSync(resolve(profile, 'shared', 'legacy-projects.json')))
+      .toBe(false);
     await page.locator('.new-session').click();
     const plain = page.locator('.session-list > .session-row.selected');
     await expect(plain.locator('strong')).toHaveText('新会话');
@@ -336,7 +368,7 @@ test('a session forks whole, and an earlier message is edited in a fork that lea
   await page.getByRole('button', { name: '发送消息', exact: true }).click();
   await settled(page);
   await expect(questions).toHaveText(['第一问', '改过的第二问']);
-  await sessionAction(page, '分叉会话');
+  await sessionAction(page, '分叉');
   await expect(page.locator('.session-row.selected strong')).toHaveText(`${title}（分叉）（分叉）`);
   await expect(questions).toHaveText(['第一问', '改过的第二问']);
   await expect(box).toHaveValue('');
@@ -517,18 +549,45 @@ test('a session on another computer is listed apart, read, and taken over with a
   await expect(computer).toHaveAttribute('aria-expanded', 'false');
   await computer.click();
   await expect(row).toHaveCount(1);
+  // The first computer's project is named and removed from here, and that computer shows it, as the service keeps
+  // the projects for every computer.
+  const heading = async () =>
+    other.locator('.elsewhere-project').nth(
+      await row.evaluate((element) => {
+        let above = element.previousElementSibling!;
+        while (!above.classList.contains('elsewhere-project'))
+          above = above.previousElementSibling!;
+        return [...document.querySelectorAll('.elsewhere-project')].indexOf(above);
+      }),
+    );
+  await (await heading()).click({ button: 'right' });
+  await other.getByRole('menuitem', { name: '修改显示名称', exact: true }).click();
+  await other.getByRole('dialog').getByLabel('显示名称').fill('远处改的名字');
+  await other.getByRole('dialog').getByRole('button', { name: '保存', exact: true }).click();
+  await expect(page.locator('.composer-context')).toContainText('远处改的名字');
+  await expect(await heading()).toContainText('远处改的名字');
+  await (await heading()).click({ button: 'right' });
+  await other.getByRole('menuitem', { name: '移除项目', exact: true }).click();
+  await expect(page.locator('.composer-context')).toContainText('普通会话');
+  // Under the other computer the session is a plain one now; added again there, the folder is its project anew.
+  await expect(row).toHaveCount(1);
+  await page.getByRole('button', { name: '添加项目', exact: true }).click();
+  await page.getByLabel('本机项目目录').fill('D:\\工作\\中文项目');
+  await page.getByRole('button', { name: '添加', exact: true }).click();
+  await expect(page.locator('.composer-context')).toContainText('中文项目');
+  await expect(await heading()).toContainText('中文项目');
   await row.click();
   await expect(other.getByText('第一台电脑上的话')).toBeVisible();
   const bar = other.locator('.elsewhere-bar');
   await expect(bar).toContainText('浏览器');
   // The first computer is connected: the session can be worked on from here, running there.
-  await expect(bar).toContainText('在这里发的消息');
+  await expect(bar).toContainText('作用于那台电脑');
   await expect(other.locator('.composer')).toBeVisible();
   await other.screenshot({ path: resolve(screenshots, 'desktop-elsewhere.png') });
   other.once('dialog', (dialog) => void dialog.accept('E:\\另一台\\接管目录'));
   await bar.getByRole('button', { name: '在本机继续…', exact: true }).click();
   // A computer that already has projects offers them first; the folder is then chosen from that list.
-  const elsewhere = other.getByRole('menuitem', { name: '选择其他文件夹…', exact: true });
+  const elsewhere = other.getByRole('menuitem', { name: '其他文件夹…', exact: true });
   if (await elsewhere.isVisible()) await elsewhere.click();
   await expect(bar).toHaveCount(0);
   await expect(
@@ -546,10 +605,15 @@ test('a session on another computer is listed apart, read, and taken over with a
   // This computer has projects, so the session comes back into one of them without a folder being asked for.
   await page.locator('.elsewhere-bar').getByRole('button', { name: '在本机继续…' }).click();
   const menu = page.getByRole('menu', { name: '会话所在的项目' });
-  await expect(menu).toContainText('这台电脑上的项目');
+  await expect(menu).toContainText('换了项目或电脑');
+  // The other computer's projects are there too, under its name, the session's own checked.
+  await expect(menu.getByRole('menuitemradio', { name: /接管目录/ })).toHaveAttribute(
+    'aria-checked',
+    'true',
+  );
   const choice = menu.getByRole('menuitemradio', { name: /中文项目/ });
   await expect(choice).toHaveAttribute('aria-checked', 'false');
-  await expect(menu.getByRole('menuitem', { name: '选择其他文件夹…' })).toBeVisible();
+  await expect(menu.getByRole('menuitem', { name: '其他文件夹…' })).toBeVisible();
   await choice.click();
   await expect(page.locator('.elsewhere-bar')).toHaveCount(0);
   await expect(
@@ -650,6 +714,8 @@ test('usage log: period-independent totals, chart hover, model filter and table'
 
 test('Electron remembers the sign-in, connects on the next launch and stays in the tray when closed', async () => {
   test.skip(process.platform !== 'win32', 'Windows desktop smoke test');
+  // Starts of the program one after another, each some seconds.
+  test.slow();
   const env: Record<string, string> = {};
   for (const [name, value] of Object.entries(process.env))
     if (value !== undefined && name !== 'ELECTRON_RUN_AS_NODE') env[name] = value;
@@ -663,10 +729,13 @@ test('Electron remembers the sign-in, connects on the next launch and stays in t
     });
   let application = await launch();
   try {
-    const page = await application.firstWindow();
-    await page.getByLabel('自动登录', { exact: true }).check();
-    await expect(page.getByLabel('记住凭据', { exact: true })).toBeChecked();
-    await login(page);
+    const launcher = await application.firstWindow();
+    await launcher.getByLabel('自动登录', { exact: true }).check();
+    await expect(launcher.getByLabel('记住凭据', { exact: true })).toBeChecked();
+    await login(launcher, false);
+    await expect((await connectionWindow(application)).locator('.connection-status')).toContainText(
+      '已连接',
+    );
   } finally {
     await application.close();
   }
@@ -674,8 +743,12 @@ test('Electron remembers the sign-in, connects on the next launch and stays in t
   expect(saved).not.toContain(connection().token);
   application = await launch();
   try {
-    const page = await application.firstWindow();
+    // The sign-in window signs in by itself, and gives way to the connection's window.
+    const page = await connectionWindow(application);
     await expect(page.locator('.connection-status')).toContainText('已连接');
+    await expect
+      .poll(() => application.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows().length))
+      .toBe(1);
     // Closing the window keeps the application and its connection alive.
     await application.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0].close());
     expect(
@@ -686,28 +759,38 @@ test('Electron remembers the sign-in, connects on the next launch and stays in t
     ).toBe(true);
     await expect(page.locator('.connection-status')).toContainText('已连接');
     await page.getByRole('button', { name: '设置与账号', exact: true }).click();
+    // Signing out ends the process, which gives way to a sign-in window of a process of its own.
+    const ended = application.process();
     await page.getByRole('menuitem', { name: '断开连接', exact: true }).click();
-    await expect(page.getByLabel('服务凭据')).toHaveValue(connection().token);
+    if (ended.exitCode === null) await new Promise((done) => ended.once('exit', done));
   } finally {
+    // The process it started holds Playwright's pipe to this one, whose close does not come until it goes.
+    endStrays(profile);
     await application.close();
   }
   // Drafts are on disk as soon as they are saved: killing the process does not lose them.
+  const drafts = resolve(connectionDirectory(profile), 'drafts.json');
+  const since = Date.now();
   application = await launch();
-  const page = await application.firstWindow();
+  const page = await connectionWindow(application);
+  // Once the page has read the drafts kept and written them back, as it does when it starts.
+  await expect(page.locator('.connection-status')).toContainText('已连接');
+  await expect
+    .poll(() => (existsSync(drafts) ? statSync(drafts).mtimeMs : 0), { timeout: 15000 })
+    .toBeGreaterThanOrEqual(since);
   await page.evaluate(() => window.desktop!.saveDrafts({ 会话: '写了很久的草稿' }));
   execFileSync('taskkill', ['/pid', String(application.process().pid), '/t', '/f']);
   application = await launch();
   try {
-    const page = await application.firstWindow();
+    const page = await connectionWindow(application);
     expect(await page.evaluate(() => window.desktop!.loadDrafts())).toEqual({
       会话: '写了很久的草稿',
     });
     // The schedule file exists from the first launch, and an edit made outside the window reaches it,
     // byte-order mark or not.
     const file = resolve(connectionDirectory(profile), 'schedules.json');
-    // The window reads the file itself as it starts; the edit below has to come after that. It signs in by
-    // itself here, so whichever of the two pages is up tells that it has started.
-    await expect(page.locator('.login-page, .shell')).toBeVisible();
+    // The window reads the file itself once it has connected; the edit below has to come after that.
+    await expect(page.locator('.shell')).toBeVisible();
     const loaded = await page.evaluate(() => window.desktop!.loadSchedules(''));
     expect(loaded.path).toBe(file);
     expect(JSON.parse(loaded.text).tasks).toEqual([]);

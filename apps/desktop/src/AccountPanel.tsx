@@ -9,11 +9,12 @@ import {
   Check,
   ListOrdered,
   KeyRound,
+  LoaderCircle,
 } from 'lucide-react';
 import type {
   AccountState,
+  AccountQuota,
   NativeCapabilities,
-  NativeMetrics,
   UsageSummary,
 } from '@cc-desk-tunnel/protocol';
 import UsagePanel, { dollars, quotaName, tokens } from './UsagePanel.tsx';
@@ -21,6 +22,7 @@ import type { ProxyClient } from './client.ts';
 import { IconButton, Page, Row, Switch } from './ui.tsx';
 import { setPrefs, usePrefs } from './prefs.ts';
 import { copyText } from './copy.tsx';
+import HelpLink from './HelpLink.tsx';
 
 // What the date a stored claude.ai sign-in ends means for the user. Renewing the access token does not move it; the
 // CLI starts warning ten days before it.
@@ -36,7 +38,7 @@ export default function AccountPanel({
   client,
   account: state,
   capabilities,
-  metrics,
+  quota,
   refreshing,
   disabled,
   error,
@@ -47,7 +49,7 @@ export default function AccountPanel({
   client: ProxyClient;
   account: AccountState | null;
   capabilities: NativeCapabilities | null;
-  metrics: NativeMetrics | null;
+  quota: AccountQuota | null;
   refreshing: boolean;
   disabled: boolean;
   error: string | null;
@@ -60,6 +62,9 @@ export default function AccountPanel({
   const [working, setWorking] = useState(false);
   const [failure, setFailure] = useState<string | null>(null);
   const [code, setCode] = useState('');
+  // A code handed to the official command, until it answers: a new link, an end, or something to say.
+  const [codeSent, setCodeSent] = useState(false);
+  useEffect(() => setCodeSent(false), [state?.login?.url, state?.notice]);
   const [token, setToken] = useState('');
   const [tokenOpen, setTokenOpen] = useState(false);
   const [confirmLogout, setConfirmLogout] = useState(false);
@@ -79,7 +84,7 @@ export default function AccountPanel({
     return () => {
       current = false;
     };
-  }, [client, metrics?.rateLimits?.measuredAt, log]);
+  }, [client, quota?.rateLimits?.measuredAt, log]);
   if (log && !usageOnly)
     return <UsagePanel client={client} summary={summary} initial={log} back={() => setLog(null)} />;
   async function act(command: Parameters<ProxyClient['request']>[0]) {
@@ -283,7 +288,10 @@ export default function AccountPanel({
               aria-label="登录 Claude 账号"
               onSubmit={(event) => {
                 event.preventDefault();
-                void act({ type: 'account.code', code: code.trim() }).then(() => setCode(''));
+                void act({ type: 'account.code', code: code.trim() }).then((sent) => {
+                  setCode('');
+                  setCodeSent(sent);
+                });
               }}
             >
               {state.login.method === 'setup-token' && (
@@ -346,9 +354,9 @@ export default function AccountPanel({
                 >
                   取消
                 </button>
-                <button className="button primary" disabled={working || !code.trim()}>
-                  <Check />
-                  完成登录
+                <button className="button primary" disabled={working || codeSent || !code.trim()}>
+                  {codeSent ? <LoaderCircle className="spinning" /> : <Check />}
+                  {codeSent ? '确认中…' : '完成登录'}
                 </button>
               </div>
             </form>
@@ -394,7 +402,10 @@ export default function AccountPanel({
       )}
       {!usageOnly && (
         <div className="page-heading account-section-title">
-          <h2>订阅用量</h2>
+          <h2>
+            订阅用量
+            <HelpLink article="quota" title="额度怎么算、怎么省" />
+          </h2>
           <button type="button" className="button secondary" onClick={() => setLog('today')}>
             <ListOrdered />
             调用日志
@@ -402,9 +413,9 @@ export default function AccountPanel({
         </div>
       )}
       <div className={`card account-card${usageOnly ? ' quota-card' : ''}`}>
-        {metrics?.rateLimits?.available ? (
+        {quota?.rateLimits?.available ? (
           <div className="quota-list">
-            {metrics.rateLimits.windows.map((window, index) => (
+            {quota.rateLimits.windows.map((window, index) => (
               <div className="quota-row" key={`${window.name}:${index}`}>
                 <div>
                   <strong>{quotaName(window.name) ?? window.name}</strong>
@@ -452,60 +463,28 @@ export default function AccountPanel({
                 })()}
               </div>
             ))}
-            {!metrics.rateLimits.windows.length && (
-              <p className="muted">原生接口未返回额度窗口。</p>
-            )}
+            {!quota.rateLimits.windows.length && <p className="muted">原生接口未返回额度窗口。</p>}
             <p className="account-updated">
-              {metrics.rateLimits.measuredAt &&
-                `更新于 ${new Date(metrics.rateLimits.measuredAt).toLocaleTimeString('zh-CN')}`}
+              {quota.rateLimits.measuredAt &&
+                `更新于 ${new Date(quota.rateLimits.measuredAt).toLocaleTimeString('zh-CN')}`}
             </p>
           </div>
         ) : (
           <p className="muted">
-            {metrics?.errors?.usage ??
+            {quota?.error ??
               quotaUnavailable ??
-              (metrics?.rateLimits ? '当前账号未提供订阅额度' : '等待读取原生额度')}
+              (quota?.rateLimits ? '当前账号未提供订阅额度' : '等待读取原生额度')}
           </p>
         )}
         <Row
           title="运行中每分钟读取一次额度"
-          detail="让服务端在有任务运行时每分钟向官方读取一次 5 小时与每周额度，各会话、各设备共用这一次读取；关闭后只记录回复里自带的额度，上方的刷新仍会读取"
+          detail="各会话、各设备共用这一次读取；关闭后只记录回复里自带的额度，上方的刷新照常读取"
         >
           <Switch
             label="运行中每分钟读取一次额度"
             checked={quotaReads}
             onChange={(value) => setPrefs((prefs) => ({ ...prefs, quotaReads: value }))}
           />
-        </Row>
-      </div>
-      <h2 className="page-heading">当前会话</h2>
-      <div className="card">
-        <Row title="输入 / 输出">
-          <span className="setting-value">
-            {metrics?.usage
-              ? `${metrics.usage.inputTokens.toLocaleString()} / ${metrics.usage.outputTokens.toLocaleString()} tokens`
-              : '等待读取'}
-          </span>
-        </Row>
-        <Row
-          title="缓存读取 / 写入"
-          detail={
-            metrics?.usage?.cacheWrite1hTokens !== undefined &&
-            `写入中 1 小时缓存 ${metrics.usage.cacheWrite1hTokens.toLocaleString()}、5 分钟缓存 ${(metrics.usage.cacheWrite5mTokens ?? 0).toLocaleString()} tokens；1 小时缓存的写入单价是 5 分钟的 1.6 倍`
-          }
-        >
-          <span className="setting-value">
-            {metrics?.usage
-              ? `${metrics.usage.cacheReadTokens.toLocaleString()} / ${metrics.usage.cacheWriteTokens.toLocaleString()} tokens`
-              : '等待读取'}
-          </span>
-        </Row>
-        <Row title="原生费用估算">
-          <span className="setting-value">
-            {metrics?.usage?.costUsd != null
-              ? `${metrics.usage.costUsd.toFixed(4)}（非订阅账单）`
-              : '未提供'}
-          </span>
         </Row>
       </div>
     </Page>
