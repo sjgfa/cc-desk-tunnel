@@ -73,6 +73,8 @@ type Text = Extract<TranscriptItem, { kind: 'user' | 'assistant' | 'thinking' }>
 export type PlanReply = { mode?: PlanMode; edited?: string; feedback?: string };
 // What the rows need from the session: the clock for running timers and how to answer an approval.
 type Live = {
+  activeRunId: string | null;
+  connected: boolean;
   now: number;
   busy: boolean;
   canApprove: (tool: Tool) => boolean;
@@ -245,7 +247,10 @@ function TaskActions({
 }
 
 function ToolRow({ tool, active, live }: { tool: Tool; active: boolean; live: Live }) {
-  const { category, verb, subject, added, removed, running, failed } = describe(tool, active);
+  const { category, verb, subject, added, removed, running, failed } = describe(
+    tool,
+    active && tool.runId === live.activeRunId,
+  );
   const Icon = icons[category];
   const pictures = useMemo(() => (tool.output ? toolPictures(tool.output) : null), [tool.output]);
   const approval = live.canApprove(tool);
@@ -429,7 +434,7 @@ function WorkGroup({
   latest: boolean;
   live: Live;
 }) {
-  const { label, waiting, running, started, ended } = summarize(work, active, latest);
+  const { label, waiting, running, incomplete, started, ended } = summarize(work, active, latest);
   // The one call of the group waited on in the foreground can be acted on without opening it; several are acted on
   // in their own lines.
   const controlled = work.items.filter(
@@ -444,7 +449,9 @@ function WorkGroup({
         <span className="work-heading">
           {running && <LoaderCircle className="spinning" />}
           <span>{label}</span>
-          {!waiting && <small>{duration(started, ended && !running ? ended : live.now)}</small>}
+          {!waiting && !incomplete && (
+            <small>{duration(started, ended && !running ? ended : live.now)}</small>
+          )}
           {control && !shown && <TaskActions tool={controlled[0]} control={control} live={live} />}
         </span>
       )}
@@ -698,7 +705,16 @@ function TurnView({
   latest: boolean;
   held: boolean;
 }) {
-  const active = !turn.endedAt;
+  const active =
+    !turn.endedAt &&
+    live.connected &&
+    !!live.activeRunId &&
+    (turn.question?.runId === live.activeRunId ||
+      turn.steps.some((step) =>
+        step.kind === 'work'
+          ? step.items.some((item) => item.runId === live.activeRunId)
+          : step.runId === live.activeRunId,
+      ));
   const expanded = usePrefs().view.mode === 'expanded';
   const notes = turn.steps.filter((step) => step.kind === 'assistant').length;
   // A turn of nothing but a compaction, as /compact makes, has nothing to fold away.
@@ -742,7 +758,7 @@ function TurnView({
           joined={turn.joined}
         />
       )}
-      {active || held || expanded || !folds
+      {!turn.endedAt || held || expanded || !folds
         ? steps()
         : turn.steps.length > 0 && (
             <>
@@ -795,6 +811,7 @@ export default function Conversation({
   events,
   history,
   connected,
+  listening,
   native,
   ownsRun,
   clock,
@@ -802,6 +819,8 @@ export default function Conversation({
   busy,
   newSession,
   loadEarlier,
+  retryHistory,
+  pauseHistory,
   replyApproval,
   stopTask,
   backgroundTask,
@@ -820,6 +839,7 @@ export default function Conversation({
   events: SessionEvent[];
   history: HistoryState | undefined;
   connected: boolean;
+  listening: boolean;
   native: boolean;
   ownsRun: boolean;
   busy: boolean;
@@ -829,6 +849,8 @@ export default function Conversation({
   suggestions?: string[];
   suggest?: (text: string) => void;
   moreExamples?: () => void;
+  retryHistory: () => void;
+  pauseHistory: () => void;
   findRequest: number;
   // Ends one background task of the run, or the run with all of them.
   stopTask: (taskId: string) => void;
@@ -971,6 +993,8 @@ export default function Conversation({
     );
   };
   const live: Live = {
+    activeRunId: session?.activeRun?.id ?? null,
+    connected,
     now,
     busy,
     answered: (tool) => !!tool.approvalId && answered.has(tool.approvalId),
@@ -1456,6 +1480,44 @@ export default function Conversation({
           </div>
         )}
       </div>
+      {session &&
+        (history?.loading || history?.loadingEarlier || history?.needsReload || history?.error) && (
+          <div className="history-sync-banner" role="status" aria-label="历史同步状态">
+            <div>
+              <strong>
+                {!connected
+                  ? '连接中断，历史尚未同步完整'
+                  : session.activeRun
+                    ? '服务端任务仍在运行'
+                    : '服务端当前无运行中的任务'}
+              </strong>
+              <span>
+                {history.loading || history.loadingEarlier
+                  ? `正在同步${history.loadingEarlier ? '早期' : ''}记录 · 已接收 ${history.receivedParts ?? 0} 段`
+                  : history.paused &&
+                      connected &&
+                      !listening &&
+                      !history.error?.startsWith('实时连接')
+                    ? '历史已暂停，正在恢复实时消息连接。'
+                    : history.error || '历史尚未同步完整，请重试。'}
+              </span>
+              <small>
+                {history.paused
+                  ? '上下文保留在服务端。旧记录及断线期间的消息可能缺失，请勿重发原任务。'
+                  : '旧记录中的未完成工具不代表仍在执行；无需重发原任务。'}
+              </small>
+            </div>
+            {history.loading || history.loadingEarlier ? (
+              <button type="button" className="button" onClick={pauseHistory}>
+                暂停历史同步
+              </button>
+            ) : (
+              <button type="button" className="button" disabled={!connected} onClick={retryHistory}>
+                重试历史同步
+              </button>
+            )}
+          </div>
+        )}
       {contextMenu && (
         <Menu label="对话文字操作" {...contextMenu} onClose={() => setContextMenu(null)} />
       )}

@@ -123,8 +123,16 @@ export type HistoryState = {
   loadingEarlier: boolean;
   // Live events received after a failed snapshot must not advance a cursor past missing history.
   needsReload?: boolean;
+  // Last complete prefix before a read began; live events must not move this past a gap.
+  resumeAfter?: number;
+  receivedParts?: number;
+  error?: string;
+  paused?: boolean;
+  retryEarlier?: boolean;
 };
 export type ClientState = {
+  // Acknowledged live subscription on this socket, independent of downloading its history.
+  listeningId: string | null;
   status: 'disconnected' | 'connecting' | 'connected' | 'reconnecting';
   connectionId: string | null;
   // The computer this client signed in as; a session's commands run on the one it is on.
@@ -179,6 +187,7 @@ export type ConnectedDevice = Extract<ServerMessage, { type: 'devices' }>['devic
 // was missed is read from the service's record; nothing is resent automatically.
 export class ProxyClient {
   state: ClientState = {
+    listeningId: null,
     status: 'disconnected',
     connectionId: null,
     device: null,
@@ -255,11 +264,13 @@ export class ProxyClient {
       sessionUpdated?: boolean;
       done?: Promise<Response>;
       command?: NewCommand;
+      liveOnly?: boolean;
     }
   >();
   // The history read before, kept on disk; and the sessions being shown from it while the service is asked.
   disk = new HistoryCache();
   private opening = new Map<string, Promise<void>>();
+  private loads = new Map<string, object>();
   getSnapshot = () => this.state;
   subscribe = (listener: () => void) => {
     this.listeners.add(listener);
@@ -452,12 +463,39 @@ export class ProxyClient {
       receive(message);
     };
     const receive = (message: ServerMessage) => {
+      if (message.type === 'session.history.part' || message.type === 'session.snapshot') {
+        const request = this.pending.get(message.requestId);
+        const receivedSessionId =
+          message.type === 'session.history.part' ? message.sessionId : message.session.id;
+        if (
+          request?.type === 'session.subscribe' &&
+          request.sessionId === this.state.selectedId &&
+          request.sessionId === receivedSessionId
+        ) {
+          if (this.state.listeningId !== request.sessionId)
+            this.update({ listeningId: request.sessionId! });
+          if (request.liveOnly) {
+            clearTimeout(request.timer);
+            this.pending.delete(message.requestId);
+            request.resolve({ type: 'response', requestId: message.requestId, ok: true });
+            return;
+          }
+        }
+      }
       if (message.type === 'session.history.part') {
         const request = this.pending.get(message.requestId);
         if (!request || request.sessionId !== message.sessionId) return;
         request.renew();
         request.parts ??= [];
         request.parts.push(message.data);
+        const history = this.state.history[message.sessionId];
+        if (history)
+          this.update({
+            history: {
+              ...this.state.history,
+              [message.sessionId]: { ...history, receivedParts: request.parts.length },
+            },
+          });
         socket.send(JSON.stringify({ type: 'session.history.next', requestId: message.requestId }));
         if (!message.last) return;
         const following = request.following ?? [];
@@ -517,6 +555,7 @@ export class ProxyClient {
           : null;
         this.update({
           status: 'connected',
+          listeningId: null,
           connectionId: message.connectionId,
           browser: message.browser ?? null,
           files: message.files ?? null,
@@ -541,6 +580,12 @@ export class ProxyClient {
         if (!request) return;
         clearTimeout(request.timer);
         this.pending.delete(message.requestId);
+        if (request.liveOnly && (message.ok || message.code === 'history_cancelled')) {
+          if (request.sessionId === this.state.selectedId)
+            this.update({ listeningId: request.sessionId! });
+          request.resolve({ ...message, ok: true });
+          return;
+        }
         if (message.ok) request.resolve(message);
         else {
           this.results.delete(message.requestId);
@@ -651,7 +696,9 @@ export class ProxyClient {
         const above =
           request.command?.type === 'session.history' && !!request.command.afterSequence;
         const history = {
-          ...(message.mode === 'prepend' && previous?.needsReload ? { needsReload: true } : {}),
+          ...(message.mode === 'prepend' && previous?.needsReload
+            ? { needsReload: true, resumeAfter: previous.resumeAfter, error: previous.error }
+            : {}),
           firstSequence:
             message.mode === 'append'
               ? (previous?.firstSequence ?? message.firstSequence)
@@ -703,6 +750,7 @@ export class ProxyClient {
       clearTimeout(timeout);
       if (this.socket !== socket) return;
       this.socket = null;
+      this.update({ listeningId: null });
       if (credentials.browser && event.code === 4001) {
         this.credentials = null;
         credentials.browser();
@@ -759,7 +807,12 @@ export class ProxyClient {
     socket?.close();
     this.rejectPending();
     this.retryAttempt = 0;
-    this.update({ status: 'disconnected', connectionId: null, setupToken: null });
+    this.update({
+      status: 'disconnected',
+      connectionId: null,
+      listeningId: null,
+      setupToken: null,
+    });
   }
   private rejectPending() {
     for (const [requestId, request] of this.pending) {
@@ -877,8 +930,14 @@ export class ProxyClient {
   }
   private load(sessionId: string) {
     const previous = this.state.history[sessionId];
-    const afterSequence = previous?.needsReload ? 0 : (previous?.lastSequence ?? 0);
+    const afterSequence =
+      previous?.needsReload || previous?.loading
+        ? (previous.resumeAfter ?? 0)
+        : (previous?.lastSequence ?? 0);
+    const attempt = {};
+    this.loads.set(sessionId, attempt);
     this.update({
+      ...(previous?.error && this.state.error === previous.error ? { error: null } : {}),
       history: {
         ...this.state.history,
         [sessionId]: {
@@ -889,11 +948,16 @@ export class ProxyClient {
             loadingEarlier: false,
           }),
           loading: true,
+          resumeAfter: afterSequence,
+          receivedParts: 0,
+          error: undefined,
+          paused: undefined,
+          retryEarlier: undefined,
         },
       },
     });
     // The service checks that the history held still ends with the event it has there.
-    const last = this.state.events[sessionId]?.at(-1);
+    const last = this.state.events[sessionId]?.find((event) => event.sequence === afterSequence);
     void this.request({
       type: 'session.subscribe',
       sessionId,
@@ -902,14 +966,19 @@ export class ProxyClient {
         ? { afterCreatedAt: last.createdAt }
         : {}),
     }).catch((error: Error) => {
-      if (error.name === 'AbortError' || this.state.selectedId !== sessionId) return;
+      if (
+        error.name === 'AbortError' ||
+        this.loads.get(sessionId) !== attempt ||
+        this.state.selectedId !== sessionId
+      )
+        return;
       const history = this.state.history[sessionId];
-      if (history)
+      if (history?.loading)
         this.update({
           error: error.message,
           history: {
             ...this.state.history,
-            [sessionId]: { ...history, loading: false, needsReload: true },
+            [sessionId]: { ...history, loading: false, needsReload: true, error: error.message },
           },
         });
     });
@@ -917,12 +986,25 @@ export class ProxyClient {
   async loadEarlier(sessionId: string) {
     const history = this.state.history[sessionId];
     if (!history?.hasEarlier || history.loadingEarlier || history.loading) return;
+    const attempt = {};
+    this.loads.set(sessionId, attempt);
     this.update({
-      history: { ...this.state.history, [sessionId]: { ...history, loadingEarlier: true } },
+      history: {
+        ...this.state.history,
+        [sessionId]: {
+          ...history,
+          loadingEarlier: true,
+          receivedParts: 0,
+          error: undefined,
+          paused: undefined,
+          retryEarlier: undefined,
+        },
+      },
     });
     try {
       const before = history.firstSequence;
       const held = this.disk.ready ? await this.disk.earlier(sessionId, before) : null;
+      if (this.loads.get(sessionId) !== attempt || this.state.selectedId !== sessionId) return;
       if (held && 'events' in held) {
         const current = this.state.history[sessionId];
         if (current?.loadingEarlier && current.firstSequence === before)
@@ -941,10 +1023,19 @@ export class ProxyClient {
         afterSequence: held?.after ?? 0,
       });
     } catch (error) {
+      if (this.loads.get(sessionId) !== attempt) return;
       const current = this.state.history[sessionId];
       if (current)
         this.update({
-          history: { ...this.state.history, [sessionId]: { ...current, loadingEarlier: false } },
+          history: {
+            ...this.state.history,
+            [sessionId]: {
+              ...current,
+              loadingEarlier: false,
+              error: error instanceof Error ? error.message : '历史读取失败。',
+              retryEarlier: true,
+            },
+          },
         });
       throw error;
     }
@@ -968,6 +1059,10 @@ export class ProxyClient {
   }
   // A session not in memory shows what is kept of it at once; the service is then asked for what came since.
   private present(sessionId: string) {
+    if (this.state.history[sessionId]?.paused) {
+      this.listen(sessionId);
+      return;
+    }
     if (this.state.history[sessionId] || !this.disk.ready) {
       if (this.state.status === 'connected') this.load(sessionId);
       return;
@@ -1041,7 +1136,7 @@ export class ProxyClient {
     if (!result) throw new Error('服务没有返回数据。');
     return result as Extract<ServerMessage, { type: Replies[T] }>;
   }
-  async request(command: NewCommand): Promise<Response> {
+  async request(command: NewCommand, liveOnly = false): Promise<Response> {
     if (this.state.status !== 'connected' || this.socket?.readyState !== WebSocket.OPEN)
       throw new Error('服务未连接。');
     const requestId = crypto.randomUUID();
@@ -1073,6 +1168,7 @@ export class ProxyClient {
         timer: setTimeout(expire, wait),
         type: command.type,
         command,
+        liveOnly,
         sessionId: history ? command.sessionId : undefined,
         renew: () => {
           clearTimeout(request.timer);
@@ -1080,7 +1176,13 @@ export class ProxyClient {
         },
       };
       this.pending.set(requestId, request);
+      if (command.type === 'session.subscribe' && this.state.listeningId !== command.sessionId)
+        this.update({ listeningId: null });
       this.socket!.send(JSON.stringify({ ...command, requestId }));
+      // Protocol 27 registers the subscription before delivering history. Cancel only that read;
+      // its cancellation reply (or first page fragment) acknowledges that live events can arrive.
+      if (liveOnly)
+        this.socket!.send(JSON.stringify({ type: 'session.history.cancel', requestId }));
     });
     this.pending.get(requestId)!.done = done;
     return done;
@@ -1097,7 +1199,87 @@ export class ProxyClient {
     if (this.state.history[sessionId]?.needsReload)
       throw new Error('会话历史尚未完整加载，请重新打开会话后重试。');
   }
+  // These controls affect reads only: no run cancellation, cache clearing, or message replay.
+  pauseHistory(sessionId: string) {
+    const earlier = this.state.history[sessionId]?.loadingEarlier;
+    this.cancelHistory(sessionId);
+    const history = this.state.history[sessionId];
+    if (history)
+      this.update({
+        history: {
+          ...this.state.history,
+          [sessionId]: {
+            ...history,
+            loading: false,
+            loadingEarlier: false,
+            needsReload: history.needsReload || history.loading,
+            paused: true,
+            retryEarlier: earlier || history.retryEarlier,
+            error: '历史同步已暂停；可发送新消息，旧记录稍后同步。',
+          },
+        },
+      });
+    this.listen(sessionId);
+  }
+  private listen(sessionId: string) {
+    if (
+      this.state.status !== 'connected' ||
+      this.state.selectedId !== sessionId ||
+      this.state.listeningId === sessionId
+    )
+      return;
+    if (
+      [...this.pending.values()].some(
+        (request) => request.liveOnly && request.sessionId === sessionId,
+      )
+    )
+      return;
+    const history = this.state.history[sessionId];
+    if (!history?.paused) return;
+    const afterSequence = history.needsReload ? (history.resumeAfter ?? 0) : history.lastSequence;
+    this.update({
+      history: {
+        ...this.state.history,
+        [sessionId]: { ...history, needsReload: true, resumeAfter: afterSequence },
+      },
+    });
+    const last = this.state.events[sessionId]?.find((event) => event.sequence === afterSequence);
+    void this.request(
+      {
+        type: 'session.subscribe',
+        sessionId,
+        afterSequence,
+        ...(last ? { afterCreatedAt: last.createdAt } : {}),
+      },
+      true,
+    ).catch((error: Error) => {
+      if (
+        error.name === 'AbortError' ||
+        this.state.selectedId !== sessionId ||
+        this.state.listeningId === sessionId
+      )
+        return;
+      const current = this.state.history[sessionId];
+      if (current?.paused)
+        this.update({
+          history: {
+            ...this.state.history,
+            [sessionId]: { ...current, error: `实时连接尚未就绪：${error.message}` },
+          },
+        });
+    });
+  }
+  retryHistory(sessionId: string) {
+    if (this.state.status !== 'connected' || this.state.selectedId !== sessionId) return;
+    this.cancelHistory(sessionId);
+    const history = this.state.history[sessionId];
+    if (history?.retryEarlier && !history.needsReload)
+      void this.loadEarlier(sessionId).catch(() => {});
+    else this.load(sessionId);
+  }
   private cancelHistory(sessionId?: string) {
+    if (sessionId) this.loads.delete(sessionId);
+    else this.loads.clear();
     for (const [requestId, request] of this.pending) {
       if (request.type !== 'session.subscribe' && request.type !== 'session.history') continue;
       if (sessionId && request.sessionId !== sessionId) continue;
