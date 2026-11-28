@@ -330,7 +330,7 @@ test('browser controls an existing device session but cannot claim a device or i
   );
   for (const command of [
     { type: 'session.create', title: 'forbidden', projectPath: '/tmp' },
-    { type: 'session.fork', sessionId: created.sessionId },
+    { type: 'session.fork', sessionId: created.sessionId, title: 'forbidden' },
     { type: 'session.move', sessionId: created.sessionId, projectPath: '/tmp' },
     { type: 'project.move', from: 'C:\\project', to: 'C:\\other' },
     { type: 'account.logout' },
@@ -487,21 +487,18 @@ test('background read types do not renew activity; a browser opens no terminal; 
   }
   assert.equal(browserActivity.has('message.send'), true);
   assert.equal(browserCommands.has('terminal.open'), false);
+  // A terminal of a session the service owns is told its project is here, and of no computer of its own.
   const args = terminalArguments(
     { executable: 'claude' },
-    { permissionMode: 'auto' } as never,
-    undefined,
     {
-      resume: false,
-      settingsPath: '/t.json',
-      execution: { platform: 'win32', shells: ['pwsh'] },
-    },
+      permissionMode: 'auto',
+      projectPath: '/data/workspace/web',
+    } as never,
+    { resume: false, settingsPath: '/t.json' },
   );
-  assert.equal(args.includes('--append-system-prompt'), false);
-  assert.equal(
-    args.some((arg) => /SSH|device-/.test(arg)),
-    false,
-  );
+  const prompt = args[args.indexOf('--append-system-prompt') + 1];
+  assert.match(prompt, /It is on this server, in "\/data\/workspace\/web"/);
+  assert.doesNotMatch(prompt, /device-pwsh|Project directory:/);
 });
 
 test('browser activity renews idle time while reads, reconnects and desktop frames do not', async (t) => {

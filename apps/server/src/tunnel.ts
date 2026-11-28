@@ -13,8 +13,10 @@ import type {
   ServerMessage,
   TunnelCredentials,
 } from '@cc-desk-tunnel/protocol';
+import { phrase, type Words } from '@cc-desk-tunnel/i18n';
 import { systemShell } from './device-terms.ts';
 import { sendSshBytes } from './channel-flow.ts';
+import { textOf } from './errors.ts';
 
 export type TunnelOptions = {
   // How long an SSH connection waits for the device to open its channel before it is dropped.
@@ -47,11 +49,12 @@ export function sessionSshPath(dataDir: string, sessionId: string) {
 }
 //
 // The user's other computers online are there too, by the host names `devices` lists (see `writeDevices`): the
-// script names the session's own computer among them.
+// script names the session's own computer among them. A session the service owns has no computer of its own, `ssh`
+// none, and reaches the user's computers all the same.
 export function sessionSsh(
   dataDir: string,
   sessionId: string,
-  ssh: SshConnection,
+  ssh: SshConnection | undefined,
   device?: string,
 ): SshConnection {
   const directory = sessionSshPath(dataDir, sessionId);
@@ -65,12 +68,16 @@ export function sessionSsh(
     writeFileSync(next, text, { mode });
     renameSync(next, path);
   };
-  const include = (path: string, hosts = 'hosts') =>
-    `Include ${JSON.stringify(path)}\nInclude ${JSON.stringify(join(dataDir, 'devices', hosts))}\nHost * !device !device-*\n  Include ~/.ssh/config /etc/ssh/ssh_config\n`;
-  write(configPath, include(ssh.configPath), 0o600);
-  const fileConfigPath = ssh.fileConfigPath ? join(directory, 'files.conf') : configPath;
-  if (ssh.fileConfigPath) write(fileConfigPath, include(ssh.fileConfigPath, 'file-hosts'), 0o600);
-  write(join(bin, 'devices'), devicesScript(join(dataDir, 'devices', 'list'), device), 0o700);
+  const include = (path: string | undefined, hosts: string) =>
+    `${path ? `Include ${JSON.stringify(path)}\n` : ''}Include ${JSON.stringify(join(dataDir, 'devices', hosts))}\nHost * !device !device-*\n  Include ~/.ssh/config /etc/ssh/ssh_config\n`;
+  const fileConfigPath = join(directory, 'files.conf');
+  write(configPath, include(ssh?.configPath, 'hosts'), 0o600);
+  write(fileConfigPath, include(ssh?.fileConfigPath ?? ssh?.configPath, 'file-hosts'), 0o600);
+  write(
+    join(bin, 'devices'),
+    devicesScript(join(dataDir, 'devices', 'list'), ssh ? device : undefined),
+    0o700,
+  );
   const quote = (value: string) => `'${value.replaceAll("'", "'\\''")}'`;
   for (const name of ['ssh', 'scp', 'sftp'])
     write(
@@ -219,7 +226,14 @@ export function probeOutput(output: Buffer) {
     .slice(0, 300);
 }
 // A probe that got no ready answer; the message is what the device or `ssh` said instead.
-export class ProbeFailure extends Error {}
+// What the device answered, or what it did not: outside text as it is, else words of the service.
+export class ProbeFailure extends Error {
+  words: Words;
+  constructor(words: Words) {
+    super(textOf(words));
+    this.words = words;
+  }
+}
 // Runs a script the way the system prompt tells Claude to, in the shell of `host`. A failure says what went wrong.
 export function sshProbe(configPath: string, host: string) {
   return new Promise<void>((resolve, reject) => {
@@ -234,8 +248,11 @@ export function sshProbe(configPath: string, host: string) {
         reject(
           new ProbeFailure(
             error?.killed
-              ? `${(PAIR_MS + 10_000) / 1000} 秒内没有应答。`
-              : said || `没有输出${error ? `（退出代码 ${error.code}）` : ''}。`,
+              ? phrase('service:probe.noAnswer', { seconds: (PAIR_MS + 10_000) / 1000 })
+              : said ||
+                  (error
+                    ? phrase('service:probe.noOutputCode', { code: String(error.code) })
+                    : phrase('service:probe.noOutput')),
           ),
         );
       },

@@ -492,6 +492,36 @@ button.chip.danger:hover:not(:disabled) {
 .login-submit {
   margin-top: 5px;
 }
+/* A client upgrade under way, where the buttons that start one were: its step, the bytes so far, a way to stop. */
+.upgrade-progress {
+  display: grid;
+  gap: 8px;
+  margin-top: 5px;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  font-size: 13px;
+}
+.upgrade-progress-line {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+}
+.upgrade-progress small {
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.upgrade-progress progress {
+  width: 100%;
+  height: 6px;
+  accent-color: var(--accent);
+}
+.upgrade-progress .button {
+  justify-self: end;
+  min-height: 28px;
+  font-size: 12px;
+}
 /* The window: a title bar across the top, then the rail of pages, the side column and the page itself. */
 .shell {
   display: grid;
@@ -2525,6 +2555,77 @@ details[open] > summary > .fold-chevron {
   padding: 6px 28px 22px;
   flex-shrink: 0;
 }
+/* Claude Code's task list above the message box (TaskChecklist.tsx). */
+.task-checklist {
+  max-width: 820px;
+  margin: 0 auto 8px;
+  border: 1px solid var(--line-soft);
+  border-radius: var(--radius);
+  background: var(--raised);
+  font-size: 13px;
+}
+.task-checklist-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 6px 10px;
+  border: 0;
+  background: none;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.task-checklist-head strong {
+  font-weight: 600;
+}
+.task-checklist-head .task-current {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  color: var(--muted);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.task-checklist-head svg {
+  width: 14px;
+  height: 14px;
+  margin-left: auto;
+  color: var(--muted);
+}
+.task-checklist ol {
+  display: grid;
+  gap: 4px;
+  max-height: 168px;
+  margin: 0;
+  padding: 0 10px 8px;
+  overflow-y: auto;
+  list-style: none;
+}
+.task-checklist li {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  line-height: 18px;
+}
+.task-checklist li svg {
+  flex: none;
+  width: 14px;
+  height: 14px;
+  margin-top: 2px;
+  color: var(--muted);
+}
+.task-checklist li.completed span {
+  color: var(--muted);
+  text-decoration: line-through;
+}
+.task-checklist li.in_progress span {
+  font-weight: 600;
+}
+.task-checklist li.in_progress svg {
+  color: var(--accent);
+}
 .composer-context {
   display: flex;
   gap: 6px;
@@ -3114,6 +3215,8 @@ div.message-input:not([aria-disabled]) .path-chip:hover .path-chip-remove {
   color: var(--muted);
   font-size: 12px;
   margin: 0;
+}
+.account-plan {
   text-transform: capitalize;
 }
 .account-identity > .button {
@@ -3263,6 +3366,30 @@ button.quota-period:hover {
   font-size: 12px;
   color: var(--muted);
 }
+/* The choices of a Markdown export (ExportDialog.tsx). */
+.export-dialog .export-field {
+  display: grid;
+  justify-items: start;
+  gap: 6px;
+  margin-bottom: 14px;
+}
+.export-dialog .export-field > span {
+  font-weight: 600;
+}
+.export-range {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+}
+.export-range label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.export-range input {
+  width: 72px;
+}
 .segmented {
   display: inline-flex;
   flex-wrap: wrap;
@@ -3284,6 +3411,43 @@ button.quota-period:hover {
 .segmented button[aria-pressed='true'] {
   background: var(--accent-soft);
   color: var(--accent-strong);
+}
+/* Syncing a project's instructions and skills (SyncDialog.tsx). */
+.sync-dialog {
+  display: grid;
+  justify-items: start;
+  gap: 10px;
+}
+.sync-dialog > p {
+  margin: 0;
+}
+.sync-route {
+  font-size: 12px;
+  word-break: break-all;
+}
+.sync-found {
+  display: grid;
+  gap: 6px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.sync-found li {
+  display: grid;
+  gap: 2px;
+}
+.sync-found span {
+  color: var(--muted);
+  font-size: 12px;
+  word-break: break-all;
+}
+.sync-dialog .check-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.sync-dialog .dialog-actions {
+  justify-self: stretch;
 }
 .usage-tiles {
   display: grid;
@@ -3704,6 +3868,9 @@ dialog::backdrop {
   margin-bottom: 23px;
 }
 .dialog-heading h2 {
+  display: flex;
+  align-items: center;
+  gap: 6px;
   margin: 0;
 }
 .dialog-form {
@@ -4644,4 +4811,125 @@ dialog:has(.ccdt-dialog) {
   background: var(--surface-2);
   white-space: pre-wrap;
   overflow-wrap: anywhere;
+}
+
+/* Settings → Plugins: a card for each plugin, which opens to its settings, trial and log. */
+.plugin-list {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.plugin-head:last-child {
+  border-bottom: 0;
+}
+.plugin-open {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  flex: 1;
+  min-width: 0;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.plugin-open > svg {
+  width: 16px;
+  height: 16px;
+  margin-top: 2px;
+  flex-shrink: 0;
+  color: var(--muted);
+}
+.plugin-open > span {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+}
+.setting-row small.plugin-trouble {
+  color: var(--warn-text);
+}
+.plugin-body {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 4px 0 16px;
+}
+.plugin-heading {
+  margin: 10px 0 0;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-2);
+}
+.plugin-note {
+  margin: 0;
+  font-size: 12.5px;
+}
+.plugin-body .settings-list label > span.plugin-input {
+  align-items: flex-end;
+  flex-shrink: 0;
+}
+.plugin-input-line {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+.plugin-input input,
+.plugin-input select {
+  width: 240px;
+  max-width: 50vw;
+}
+.plugin-events {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.plugin-log-head {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+.plugin-log-head .plugin-heading {
+  margin-right: auto;
+}
+.plugin-log {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  max-height: 360px;
+  overflow: auto;
+  font-size: 12.5px;
+}
+.plugin-log li {
+  padding: 8px 0;
+  border-bottom: 1px solid var(--line-soft);
+}
+.plugin-log li:last-child {
+  border-bottom: 0;
+}
+.plugin-log-line {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+}
+.plugin-log pre {
+  margin: 6px 0 0;
+  padding: 8px 10px;
+  max-height: 160px;
+  overflow: auto;
+  border-radius: 8px;
+  background: var(--surface-2);
+  font-size: 12px;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+.plugin-ok {
+  color: var(--ok-text);
+}
+.plugin-bad {
+  color: var(--danger-text);
 }

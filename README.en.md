@@ -86,7 +86,7 @@ If you have one computer and Claude Code runs well on it locally, the local vers
 | | |
 | --- | --- |
 | 🖥️ **Several computers** | Projects and sessions of every computer in one list, offline ones included; start a session on another online computer or move one there; a session reaches your other online computers by name; `ccdt online` keeps a machine without a desktop online |
-| 🗂️ **Projects and sessions** | Projects are registered on the service and shared by every client; rename or remove them; create, search, fork, export to Markdown; edit and resend any of your own messages |
+| 🗂️ **Projects and sessions** | Projects are registered on the server and shared by every client; rename or remove them; create, search, fork, export to Markdown; edit and resend any of your own messages |
 | 💬 **The conversation** | Streaming replies, thinking summaries, tool calls with their input and results; add messages during a run, stop at any time; plans shown as documents you can edit before they run |
 | 🎛️ **Native controls** | Model, reasoning effort, approval mode, context usage and manual compaction, common Claude Code settings; open the current session in `ccdt` with one click |
 | ⌨️ **Terminal client** | `ccdt` opens the official Claude Code in your own terminal, sharing sessions, context and usage statistics with the desktop client; it uses less of the 5-hour quota (see [Your account](docs/account.en.md)) |
@@ -95,8 +95,9 @@ If you have one computer and Claude Code runs well on it locally, the local vers
 | 📱 **Browser and phone** | Optional: work on sessions of online computers, or start plain sessions that run on the server; install it as an app on a phone; adds no port or container |
 | 📊 **Account and usage** | Sign the server's Claude account in or out from the client; see quota, reset times and usage statistics; compact automatically before the prompt cache expires |
 | ⏰ **Scheduled tasks** | The client sends a prepared prompt to a session, or a new one, at a set time; Claude can set these up for you |
-| ⬆️ **Upgrades and backups** | Upgrade the service and the clients with one click in the client, without logging in to the server; back up and restore the service with one command |
+| ⬆️ **Upgrades and backups** | Upgrade the server and the Windows client with one click in the client, without logging in to the server machine; back up and restore the server with one command |
 | 🧩 **Convenience** | Runs in the tray, remembers the sign-in, keeps unsent text per session |
+| 🌐 **Languages** | Simplified Chinese and English, following the system or chosen in the settings; the whole help and `ccdt` speak both |
 
 ## ⚙️ How it works
 
@@ -118,17 +119,17 @@ This repository publishes all of its own client, server, build and deployment so
 **You need:**
 
 - 🐧 **A server**: Linux with a public IP or domain name and Docker installed, Ubuntu recommended; x86_64, or arm64 as experimental support. Builds and tests run on your computers, so **an entry-level machine with 2 vCPUs and 1 GB of memory is enough**.
-- 💻 **Computers**: Windows 10 / 11 x64. The desktop client and `ccdt` on macOS and Linux are experimental; use `ccdt` on Linux without a desktop.
+- 💻 **Computers**: Windows 10 / 11 x64, macOS 13 or later (Apple silicon or Intel), or Linux x64. The desktop client and `ccdt` on macOS and Linux are experimental; use `ccdt` on Linux without a desktop.
 
 ### 1. Deploy the service
 
 On the server:
 
 ```sh
-sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/sun168567/cc-desk-tunnel/main/deploy/install.sh)"
+sudo env CC_DESK_TUNNEL_LANG=en bash -c "$(curl -fsSL https://github.com/sun168567/cc-desk-tunnel/releases/latest/download/install.sh)"
 ```
 
-Press Enter through the questions. At the end it prints what the client needs — **service address, certificate fingerprint, service token** — and the port to open in the firewall (TCP 8787 by default, the only one). From then on, the client's Settings → About and updates upgrades the service too, so you rarely need the server again.
+`CC_DESK_TUNNEL_LANG=en` has the script, and the `cc-desk-tunnel` command it leaves, speak English (Chinese without it); later commands keep it. Press Enter through the questions. At the end it prints what the client needs — **service address, certificate fingerprint, service token** — and the port to open in the firewall (TCP 8787 by default, the only one). From then on, the client's Settings → About and updates upgrades the service too, so you rarely need the server again.
 
 <details>
 <summary>What the script does · everyday commands</summary>
@@ -157,24 +158,24 @@ Install either client or both. Each must be the **same version** as the service.
 
 | | Good for | Get it |
 | --- | --- | --- |
-| 🖥️ **Desktop client** | Managing sessions on all your computers by project, the process folded into summaries | The table at the top of the [latest release](https://github.com/sun168567/cc-desk-tunnel/releases/latest): Windows `.exe`; macOS `.dmg` and Linux `.deb` (experimental, see [macOS](docs/macos.md) · [Linux](docs/linux.md), in Chinese) |
+| 🖥️ **Desktop client** | Managing sessions on all your computers by project, the process folded into summaries | The table at the top of the [latest release](https://github.com/sun168567/cc-desk-tunnel/releases/latest): Windows `.exe`; macOS Apple silicon or Intel `.dmg` and Linux `.deb` (experimental, see [macOS](docs/macos.md) · [Linux](docs/linux.md), in Chinese) |
 | ⌨️ **Terminal client** | `ccdt`: the official Claude Code in your own terminal; also machines without a desktop | Included with the desktop client; to use only the terminal, install it on its own with the commands below |
 
 The Windows installer bundles PowerShell 7, OpenSSH and `ccdt`; nothing else is needed. Start it, enter the three values from step 1 and connect.
 
 > [!NOTE]
-> The installers are not code-signed. When Windows shows "Windows protected your PC" on first run, choose "More info → Run anyway"; if security software blocks a bundled component, verify before allowing it, see [Antivirus and SmartScreen](docs/troubleshooting.en.md#antivirus-and-smartscreen). The macOS and Linux clients are upgraded by downloading and installing the new package.
+> The Windows installers are not code-signed. When Windows shows "Windows protected your PC" on first run, choose "More info → Run anyway"; if security software blocks a bundled component, verify before allowing it, see [Antivirus and SmartScreen](docs/troubleshooting.en.md#antivirus-and-smartscreen). The macOS app has an ad hoc signature and has not been notarized by Apple. On macOS and Linux, upgrade by downloading and installing the new package.
 
 To install `ccdt` on its own (for the current user, no administrator rights needed; then run `ccdt login`):
 
 ```powershell
 # Windows (PowerShell)
-irm https://raw.githubusercontent.com/sun168567/cc-desk-tunnel/main/deploy/install-ccdt.ps1 | iex
+irm https://github.com/sun168567/cc-desk-tunnel/releases/latest/download/install-ccdt.ps1 | iex
 ```
 
 ```sh
 # macOS, Linux (experimental)
-curl -fsSL https://raw.githubusercontent.com/sun168567/cc-desk-tunnel/main/deploy/install-ccdt.sh | sh
+curl -fsSL https://github.com/sun168567/cc-desk-tunnel/releases/latest/download/install-ccdt.sh | sh
 ```
 
 The script installs the newest release and checks it against `SHA256SUMS`; if the service is not on the newest release, install the same version as the service, see [Terminal client](docs/cli.md#安装) (in Chinese).
@@ -249,6 +250,7 @@ npm ci
 npm run dev               # local simulated service + browser UI, no account needed
 npm test                  # unit tests; also typecheck, test:ui, check
 npm run package:windows   # builds the Windows installer; preparation in apps/desktop/README.md
+npm run package:macos     # on a Mac, builds a DMG for its CPU in artifacts/macos/
 npm run package:server    # builds the server archive; on the server, run its deploy/install.sh
 ```
 

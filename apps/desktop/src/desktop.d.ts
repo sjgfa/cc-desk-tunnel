@@ -8,7 +8,13 @@ declare global {
       platform: 'win32' | 'darwin' | 'linux';
       // Which of this computer's connections the window is ('' the first), and what they all share.
       // `launcher`: a sign-in window, which is no connection's (see Launcher.tsx).
-      boot: { connection: string; launcher?: boolean; shared: import('./shared.ts').Shared };
+      boot: {
+        connection: string;
+        launcher?: boolean;
+        shared: import('./shared.ts').Shared;
+        // The system's languages, most preferred first.
+        languages: string[];
+      };
       saveShared: (key: 'prefs', value: unknown) => Promise<void>;
       // The computer's project list from before the service kept them, while this connection has yet to hand it
       // to its service, and the call that says it has (see App.tsx).
@@ -73,7 +79,7 @@ declare global {
             to: { target: string; dir: string };
             conflict?: 'replace' | 'skip' | 'resume';
           },
-        ) => Promise<{ files: number; bytes: number }>;
+        ) => Promise<{ files: number; bytes: number; cancelled?: true }>;
         cancel: (id: string) => Promise<void>;
         // What git sees changed in a project of this computer; null outside a repository or without git.
         changes: (directory: string) => Promise<{ path: string; status: string }[] | null>;
@@ -160,11 +166,29 @@ declare global {
       // This computer as the service knows it.
       device: () => Promise<import('@cc-desk-tunnel/protocol').Device>;
       // Fetches and runs an installer: the one the connected service holds, or, given a version, that
-      // version's from the release page.
-      installUpdate: (version?: string) => Promise<void>;
+      // version's from the release page. Ends `cancelled` when stopped with `cancelUpdate`; otherwise the
+      // client quits for the installer.
+      installUpdate: (version?: string) => Promise<{ cancelled?: boolean }>;
+      cancelUpdate: () => Promise<void>;
       onUpdateProgress: (
-        callback: (progress: { received: number; size: number }) => void,
+        callback: (step: import('./client-upgrade.ts').UpgradeStep) => void,
       ) => () => void;
+      // What a service that refused this client says to it now (see probeService in electron/service-upgrade.mjs).
+      probeService: (config: {
+        url: string;
+        fingerprint: string;
+        token: string;
+        deviceName: string;
+      }) => Promise<
+        | { status: 'ready' | 'unreachable' }
+        | { status: 'failed'; error: string }
+        | {
+            status: 'refused';
+            service: string | null;
+            release: string | null;
+            preparing: number | null;
+          }
+      >;
       // Has a service that refused this client as the newer one upgrade itself to the newest release, given
       // the service's version from the refusal; ends with the version installed or why it was not.
       upgradeService: (config: {
@@ -175,7 +199,13 @@ declare global {
         service: string;
         // Upgrades even while sessions are at work (see FORCED_UPGRADE_SINCE).
         force?: boolean;
-      }) => Promise<{ version?: string; error?: string; code?: string }>;
+      }) => Promise<{
+        version?: string;
+        error?: string;
+        // What the service said, when it said it as a phrase; `error` is the text it sent with it, if any.
+        phrase?: import('@cc-desk-tunnel/protocol').Phrase;
+        code?: string;
+      }>;
       // Opens the session in ccdt, the terminal client, signed in to this window's service with its token; says
       // instead when ccdt is not installed, or not of this client's release.
       openInCcdt: (request: {

@@ -5,7 +5,7 @@
 ## 分支和当前基线
 
 - `main`：保留 fork 创建时的上游主分支，后续可同步上游。
-- `custom/stable`：维护本 fork 的 macOS 原生服务适配和客户端修复，当前基于正式版 `v0.3.19`，协议 29。
+- `custom/stable`：维护本 fork 的 macOS 原生服务适配和客户端修复，当前基于正式版 `v0.3.22`，协议 30。
 - `windows-client`：Windows 端维护的客户端分支。历史恢复和暂停同步后继续聊天的补丁已合入 `custom/stable`，旧版验证记录见 [Windows 维护说明](FORK-MAINTENANCE.md)。
 - `origin`：本 fork；`upstream`：原项目。日常改动推送到 `origin`。
 

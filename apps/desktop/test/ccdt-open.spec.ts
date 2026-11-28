@@ -53,6 +53,7 @@ test('a session opens in ccdt signed in as the window is, or the window says how
         return send({
           type: 'ready',
           protocolVersion: PROTOCOL_VERSION,
+          serverDeviceId: '00000000-0000-4000-8000-000000000001',
           version: '0.0.1',
           connectionId: randomUUID(),
           adapter: 'claude-code',
@@ -86,7 +87,12 @@ test('a session opens in ccdt signed in as the window is, or the window says how
   env.Path = `${bin};${process.env.SystemRoot}\\System32`;
   env.LOCALAPPDATA = resolve(root, 'local');
   const application = await _electron.launch({
-    args: [resolve('apps/desktop'), '--smoke-test', ...connectionArgs(resolve(root, 'profile'))],
+    args: [
+      resolve('apps/desktop'),
+      '--smoke-test',
+      '--lang=zh-CN',
+      ...connectionArgs(resolve(root, 'profile')),
+    ],
     env,
   });
   try {
@@ -108,7 +114,7 @@ test('a session opens in ccdt signed in as the window is, or the window says how
     await open();
     await expect(dialog.getByRole('heading')).toHaveText('安装 ccdt');
     await expect(dialog.locator('pre')).toHaveText(
-      `$env:CCDT_VERSION = '${version}'; irm https://raw.githubusercontent.com/sun168567/cc-desk-tunnel/main/deploy/install-ccdt.ps1 | iex`,
+      `$env:CCDT_VERSION = '${version}'; irm https://github.com/sun168567/cc-desk-tunnel/releases/latest/download/install-ccdt.ps1 | iex`,
     );
     await expect(dialog.getByRole('button', { name: '安装说明' })).toBeVisible();
     await page.screenshot({ path: resolve(folder, '01-未安装.png') });

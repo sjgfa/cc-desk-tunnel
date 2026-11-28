@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { mkdirSync, readFileSync, readdirSync, renameSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
+import { languages } from '@cc-desk-tunnel/i18n';
 
 const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
@@ -17,9 +18,30 @@ export function directories(env = process.env, platform = process.platform, home
   return { cli: env.CCDT_CONFIG_DIR ?? join(base, 'ccdt'), desktop: join(base, 'CC Desk Tunnel') };
 }
 
+// Several ccdt run at once, as agents start them, and each saves what it used. On Windows a file that another process
+// is replacing can be neither read nor replaced for a moment: that is tried again shortly, not taken for no settings
+// (which the next save would write over the servers signed in to) or for a failed command.
+const BUSY = new Set(['EPERM', 'EACCES', 'EBUSY']);
+function patiently(action) {
+  for (let tries = 1; ; tries++) {
+    try {
+      return action();
+    } catch (error) {
+      if (!BUSY.has(error?.code) || tries === 50) throw error;
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10 + Math.random() * 20);
+    }
+  }
+}
+
 function readJson(path) {
+  let text;
   try {
-    const value = JSON.parse(readFileSync(path, 'utf8'));
+    text = patiently(() => readFileSync(path, 'utf8'));
+  } catch {
+    return {};
+  }
+  try {
+    const value = JSON.parse(text);
     return value && typeof value === 'object' && !Array.isArray(value) ? value : {};
   } catch {
     return {};
@@ -31,7 +53,7 @@ function writeJson(path, value) {
   mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
   const temporary = `${path}.${process.pid}.tmp`;
   writeFileSync(temporary, `${JSON.stringify(value, null, 2)}\n`, { mode: 0o600 });
-  renameSync(temporary, path);
+  patiently(() => renameSync(temporary, path));
 }
 
 // Two addresses are one service when they name the same place: scheme and host in any case, the default port
@@ -58,7 +80,8 @@ export const hostOf = (url) => {
 
 // `servers` are the services signed in to, by address, each with when it was last connected to (`usedAt`); `current`
 // is the one used when none is named: the one connected to last. `waits` are the seconds each step of connecting may
-// take where they are not the defaults (see `ccdt config`).
+// take where they are not the defaults, `language` the one ccdt writes in where it is not the system's (see
+// `ccdt config`).
 export class Config {
   constructor(paths = directories()) {
     this.paths = paths;
@@ -68,6 +91,7 @@ export class Config {
     this.current = typeof value.current === 'string' ? value.current : undefined;
     this.deviceId = typeof value.deviceId === 'string' ? value.deviceId : undefined;
     this.waits = value.waits && typeof value.waits === 'object' ? value.waits : {};
+    this.language = languages.includes(value.language) ? value.language : undefined;
   }
   save() {
     writeJson(this.path, {
@@ -75,6 +99,7 @@ export class Config {
       current: this.current,
       deviceId: this.deviceId,
       ...(Object.keys(this.waits).length ? { waits: this.waits } : {}),
+      ...(this.language ? { language: this.language } : {}),
     });
   }
   server(url) {

@@ -1,7 +1,9 @@
+import { failureText } from '../electron/words.mjs';
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { WebSocket, WebSocketServer } from 'ws';
-import { upgradeService } from '../electron/service-upgrade.mjs';
+import { PROTOCOL_VERSION } from '@cc-desk-tunnel/protocol';
+import { probeService, upgradeService } from '../electron/service-upgrade.mjs';
 
 // A 0.3.2 service: signs in only a client of protocol 17, and answers an update check with `found`.
 async function upgrade(found, service = '0.3.2', confirm) {
@@ -53,12 +55,12 @@ test('a newer client signs in to an older service with its protocol version and 
 
 test('a service that cannot upgrade from here says why', async () => {
   const manual = (await upgrade('manual')).result;
-  assert.match(manual.message, /cc-desk-tunnel upgrade/);
+  assert.match(failureText(manual), /cc-desk-tunnel upgrade/);
   assert.equal(manual.code, 'manual');
   const idle = (await upgrade('idle')).result;
-  assert.match(idle.message, /没有找到/);
+  assert.match(failureText(idle), /没有找到/);
   assert.equal(idle.code, 'current');
-  assert.match((await upgrade('available', '0.1.0')).result.message, /太旧/);
+  assert.match(failureText((await upgrade('available', '0.1.0')).result), /太旧/);
 });
 
 test('the install waits for a yes, and a no leaves the service as it is', async () => {
@@ -122,4 +124,69 @@ test('a service with sessions at work says so as busy, and a forced upgrade asks
   } finally {
     await new Promise((resolve) => server.close(resolve));
   }
+});
+
+// A service that answers a sign-in with `answer`, or not at all; what it was sent is kept.
+async function probe(t, answer) {
+  const server = new WebSocketServer({ port: 0, host: '127.0.0.1' });
+  await new Promise((resolve) => server.once('listening', resolve));
+  t.after(() => new Promise((resolve) => server.close(resolve)));
+  const received = [];
+  server.on('connection', (socket) =>
+    socket.on('message', (raw) => {
+      received.push(JSON.parse(raw.toString()));
+      if (answer) socket.send(JSON.stringify(answer));
+    }),
+  );
+  const url = `ws://127.0.0.1:${server.address().port}/ws`;
+  const result = await probeService(
+    { url, fingerprint: '', token: 'a'.repeat(32), deviceName: '这台电脑' },
+    { open: () => new WebSocket(url), timeoutMs: 300 },
+  );
+  return { result, received };
+}
+
+test('a service is asked at sign-in what it says to this client, and how far it has fetched its installer', async (t) => {
+  const preparing = await probe(t, {
+    type: 'connection.error',
+    code: 'version_mismatch',
+    message: '版本不一致',
+    service: '9.9.9',
+    preparing: { version: '9.9.9', received: 25, size: 100 },
+  });
+  assert.deepEqual(preparing.result, {
+    status: 'refused',
+    service: '9.9.9',
+    release: null,
+    preparing: 0.25,
+  });
+  assert.deepEqual(preparing.received, [
+    {
+      type: 'auth',
+      protocolVersion: PROTOCOL_VERSION,
+      token: 'a'.repeat(32),
+      deviceName: '这台电脑',
+    },
+  ]);
+  const held = await probe(t, {
+    type: 'connection.error',
+    code: 'version_mismatch',
+    message: '版本不一致',
+    service: '9.9.9',
+    client: { version: '9.9.9', size: 1, sha256: '0'.repeat(64) },
+  });
+  assert.deepEqual(held.result, {
+    status: 'refused',
+    service: '9.9.9',
+    release: '9.9.9',
+    preparing: null,
+  });
+  assert.deepEqual((await probe(t, { type: 'ready' })).result, { status: 'ready' });
+  const wrong = await probe(t, {
+    type: 'connection.error',
+    code: 'unauthorized',
+    message: '凭据不对',
+  });
+  assert.deepEqual(wrong.result, { status: 'failed', error: '凭据不对' });
+  assert.deepEqual((await probe(t, null)).result, { status: 'unreachable' });
 });

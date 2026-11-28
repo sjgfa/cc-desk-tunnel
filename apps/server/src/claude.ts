@@ -9,7 +9,9 @@ import type {
   PermissionMode,
   PlanMode,
 } from '@cc-desk-tunnel/protocol';
-import { deviceTerms } from './device-terms.ts';
+import { phrase } from '@cc-desk-tunnel/i18n';
+import { said } from './errors.ts';
+import { sessionPrompt } from './session-prompt.ts';
 import type { Execution } from './device-terms.ts';
 import { ClaudeStream } from './claude-stream.ts';
 import type { SshConnection } from './tunnel.ts';
@@ -22,6 +24,11 @@ import { questionTally } from './question.ts';
 
 // Whether the native session is on record once a run or a terminal let it go, for the clients to offer compacting it.
 // It is recorded last, so that the page of history a client opens the session with holds it.
+// What the service starts the CLI with unless its environment or the user's settings say otherwise (the settings'
+// `env` is applied by the CLI over its environment). Claude Code keeps a task list only on older models unless
+// asked to; the clients show that list, as the official guide says an application that renders progress should.
+export const cliDefaults: Record<string, string> = { CLAUDE_CODE_ENABLE_TODO_TOOLS: '1' };
+
 export function nativeContext(sessionId: string, info: SDKSessionInfo | undefined) {
   return {
     type: 'native.context',
@@ -49,14 +56,17 @@ export type ClaudeOptions = {
   contextRetentionDays?: number;
   // Added to the CLI's inherited environment; set by the service for its usage collector.
   environment?: Record<string, string>;
+  // The help of CC Desk Tunnel as Markdown (scripts/help-markdown.mjs), where the build put it: the prompt points
+  // Claude to it, and it may read it there without asking.
+  help?: string;
 };
 export type ClaudeRun = {
   sessionId: string;
   // The session whose Linux directory holds this session's native history; itself unless it is a fork.
   nativeRoot: string;
   projectPath: string;
-  // How commands run on the device, as the session's prompt has it.
-  execution: Execution;
+  // How commands run on the session's own computer, as its prompt has it; none for a session the service owns.
+  execution?: Execution;
   permissionMode: PermissionMode;
   model?: string | null;
   effort?: Effort | null;
@@ -77,7 +87,7 @@ export type ClaudeRun = {
     unanswered?: Unanswered;
     plan?: PlanDecision;
   }>;
-  // Absent only for a session owned by the service itself.
+  // The session's `ssh`, `scp` and `sftp`, which reach the user's computers (see `sessionSsh`).
   ssh?: SshConnection;
   // Told when Claude has finished its turn and the run goes on only for background tasks, and when it resumes.
   waiting: (background: boolean) => void;
@@ -159,23 +169,6 @@ export function sshPath(
   return ssh?.bin ? { PATH: path ? `${ssh.bin}${delimiter}${path}` : ssh.bin } : {};
 }
 
-// `sessionId` is the proxy's name for the session, which a scheduled task needs to continue it.
-export function remotePrompt(projectPath: string, sessionId: string, execution: Execution) {
-  const terms = deviceTerms(execution, projectPath);
-  return [
-    "The user's projects are on their own computer, the device, NOT on this Linux host, which only runs Claude Code and has no copy of them.",
-    `Device: ${terms.name}. Project directory: ${JSON.stringify(projectPath)}.`,
-    "Do all project reads, edits, searches and commands on the device with your native Bash tool over SSH: here ssh, scp and sftp know the device by the host names below, and reach any other host as they otherwise would. Do not use this host's Read/Edit tools on project files, and do not read or copy the keys these hosts sign in with.",
-    terms.script,
-    terms.command,
-    "device always means this session's own computer. Only when the user refers to another of their computers, run devices: it lists those online, each with host names used as device's are, the one ending in a shell's name taking a script in that shell. Do there only what the user asked, and confirm before changing anything.",
-    'If the device is unreachable, say so; never fall back to this host. After an interruption report results as unknown; do not repeat side effects on your own.',
-    'To look at a picture on the device, such as a pasted screenshot or an attached image, copy that one file with scp to a temporary file on this host, open it with the Read tool, and delete the copy afterwards. That is the only use of Read on this host for a file from the device.',
-    'Commands may run concurrently. One that blocks holds the turn until its Bash timeout: size the timeout to the work, and run anything long-lived, such as a dev server or watcher, as a background Bash task. Do not count on a process outliving the ssh command that started it, nor on ending the command to stop it: keep the command running for as long as the process is needed, and stop the process itself on the device.',
-    `Scheduled and recurring prompts are sent by the desktop client, not by cron on this host: edit the UTF-8 JSON file whose path is in the device's CC_DESK_TUNNEL_SCHEDULES environment variable (its "说明" field documents the format; changes apply within seconds). Where that variable is empty the device is connected by ccdt, which sends none: say so instead of making a schedule elsewhere. This session's ID for a task that continues it: ${sessionId}.`,
-  ].join('\n');
-}
-
 // The Linux working directory of a session's project, which its sessions share as they would the project's own
 // folder: the CLI keys native history, auto memory and project settings by it. A fork stays in the directory of
 // the session it came from, which is where the CLI puts a fork's history.
@@ -220,8 +213,7 @@ export async function runClaude(
     run.emit({
       type: 'run.error',
       code: 'native_context_missing',
-      message:
-        'Claude Code 原生上下文不存在；不会用界面记录伪造恢复或另开会话。请检查原生存储与备份。',
+      ...said(phrase('service:run.contextMissing')),
     });
     return 'failed';
   }
@@ -259,11 +251,10 @@ export async function runClaude(
         systemPrompt: {
           type: 'preset',
           preset: 'claude_code',
-          ...(run.ssh
-            ? { append: remotePrompt(run.projectPath, run.sessionId, run.execution) }
-            : {}),
+          append: sessionPrompt(run.projectPath, run.sessionId, run.execution, options.help),
           snapshot: false,
         },
+        ...(options.help ? { additionalDirectories: [options.help] } : {}),
         ...(run.resume ? { resume: run.sessionId } : { sessionId: run.sessionId }),
         model: run.model ?? options.model,
         effort: run.effort ?? undefined,
@@ -286,7 +277,7 @@ export async function runClaude(
           ],
         },
         maxTurns: options.maxTurns,
-        env: { ...process.env, ...options.environment, ...sshPath(run.ssh) },
+        env: { ...cliDefaults, ...process.env, ...options.environment, ...sshPath(run.ssh) },
         stderr: (text) => {
           stderr = (stderr + text).slice(-8192);
         },
@@ -518,7 +509,7 @@ export async function runClaude(
               run.emit(ttl ? { ...payload, cacheTtl: ttl } : payload);
             } else run.emit(payload);
           } catch {
-            run.emit({ type: 'native.notice', text: '本轮原生状态未能读取；任务结果不受影响。' });
+            run.emit({ type: 'native.notice', text: phrase('service:notice.metricsFailed') });
           }
           const expiry = loginExpiry(message.credential_expires_at);
           if (expiry) run.emit({ type: 'native.notice', text: expiry });
@@ -559,12 +550,13 @@ export async function runClaude(
     run.emit({ type: 'native.title', title: context.summary.trim().slice(0, 120) });
   for (const tool of mapper.tools.values())
     if (!tool.finished) {
+      const { message: output, phrase: note } = said(phrase('service:tool.endedUnknown'));
       run.emit({
         type: 'tool.result',
         toolId: tool.id,
         status: 'unknown',
-        output:
-          '运行结束；该工具最终执行结果未确认。已发出的 SSH 命令可能继续执行，副作用未撤销，不能自动重放。',
+        output,
+        phrase: note,
         exitCode: null,
       });
     }
@@ -620,7 +612,7 @@ export async function readNativeStatus(
         abortController: controller,
         settings: options.settingsPath,
         settingSources: ['user', 'project', 'local'],
-        env: { ...globalThis.process.env, ...options.environment },
+        env: { ...cliDefaults, ...globalThis.process.env, ...options.environment },
       },
     });
     // Keep draining while control requests are in flight; no model prompt is submitted.

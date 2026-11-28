@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict';
 import { createHash, randomUUID } from 'node:crypto';
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { createServer as createHttpServer } from 'node:http';
+import type { AddressInfo } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
@@ -13,6 +15,7 @@ import { quotas } from '../src/claude.ts';
 import { createProxyServer, upgradeHeld } from '../src/server.ts';
 import { SessionStore } from '../src/store.ts';
 import { serviceVersion } from '../src/updates.ts';
+import { textOf } from '../src/errors.ts';
 
 const token = 'offline-test-' + randomUUID();
 // One computer unless a test is about several.
@@ -145,6 +148,63 @@ test('cancelling only history keeps live message delivery, including on a new co
       1,
     );
   }
+});
+
+test('a plugin added while the service runs hears of a wait, its end and the end of the run', async (t) => {
+  const f = await fixture(t);
+  const client = await f.connect();
+  const sessionId = await f.create(client);
+  const root = join(f.directory, 'plugins', 't.log');
+  mkdirSync(join(root, 'hooks'), { recursive: true });
+  writeFileSync(
+    join(root, 'log.mjs'),
+    "import { readFileSync, writeFileSync } from 'node:fs';\n" +
+      'const event = JSON.parse(readFileSync(0, "utf8"));\n' +
+      'writeFileSync(`${process.env.CLAUDE_PLUGIN_DATA}/${event.hook_event_name}`, JSON.stringify(event));\n',
+  );
+  const log = [
+    {
+      hooks: [
+        { type: 'command', command: process.execPath, args: ['${CLAUDE_PLUGIN_ROOT}/log.mjs'] },
+      ],
+    },
+  ];
+  writeFileSync(
+    join(root, 'hooks', 'hooks.json'),
+    JSON.stringify({ hooks: { ApprovalRequested: log, WaitResolved: log, RunEnded: log } }),
+  );
+  // The directory is read once its changes have settled.
+  await new Promise((resolve) => setTimeout(resolve, 1000));
+  const heard = async (name: string) => {
+    for (const deadline = Date.now() + 10_000; Date.now() < deadline;) {
+      try {
+        return JSON.parse(readFileSync(join(f.directory, 'plugin-data', 't.log', name), 'utf8'));
+      } catch {
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+    }
+    throw new Error(`The plugin did not hear ${name}`);
+  };
+  await client.request({ type: 'message.send', sessionId, text: '试试', scenario: 'tool' });
+  const asked = await client.event('approval.requested');
+  assert.ok(asked.type === 'session.event' && asked.event.payload.type === 'approval.requested');
+  const { runId, payload } = asked.event;
+  const waiting = await heard('ApprovalRequested');
+  assert.equal(waiting.version, 1);
+  assert.equal(waiting.session_title, '中文会话');
+  assert.equal(waiting.device.name, device.name);
+  assert.equal(waiting.tool_name, 'PowerShell');
+  assert.equal(waiting.wait_id, payload.approvalId);
+  await client.request({
+    type: 'approval.reply',
+    sessionId,
+    runId,
+    approvalId: payload.approvalId,
+    allowed: false,
+  });
+  const resolved = await heard('WaitResolved');
+  assert.deepEqual([resolved.wait_id, resolved.allowed], [waiting.wait_id, false]);
+  assert.equal((await heard('RunEnded')).status, 'completed');
 });
 
 test('requires authentication, rejects wrong token/version/origin and accepts health', async (t) => {
@@ -470,7 +530,10 @@ test('a computer that stays away longer than the grace has its run stopped; one 
   assert.equal(after.session.activeRun, null);
   const stop = after.events.findLast((event) => event.payload.type === 'run.status')?.payload;
   assert.ok(stop?.type === 'run.status' && stop.status === 'cancelled');
-  assert.match(stop.reason ?? '', /设备离线/);
+  assert.equal(
+    stop.reason && textOf(stop.reason),
+    '设备离线超过 0 秒，运行已停止；在途命令结果可能未知。',
+  );
 
   const patient = await fixture(t, 2, 60_000);
   const left = await cutOff(patient, true);
@@ -533,6 +596,7 @@ test('a session runs on its own computer whichever sends to it; another one take
   const forked = await away.request({
     type: 'session.fork',
     sessionId,
+    title: '分叉',
     projectPath: 'E:\\笔记本\\项目',
   });
   assert.ok(forked.type === 'response' && forked.ok && forked.sessionId);
@@ -908,6 +972,38 @@ test('session directory does not push history; switching subscribes to only the 
   );
 });
 
+test('a new session offers the models Claude Code last gave in any session, without counting as use', async (t) => {
+  const f = await fixture(t);
+  const client = await f.connect();
+  const first = await f.create(client);
+  const read = (sessionId: string) =>
+    f.server.store
+      .snapshot(sessionId)
+      .events.filter((event) => event.payload.type === 'native.capabilities')
+      .map((event) => event.payload);
+  // Nothing has been read yet: a new session holds no reading.
+  assert.deepEqual(read(first), []);
+  const capabilities = {
+    type: 'native.capabilities' as const,
+    models: [
+      {
+        value: 'default',
+        displayName: 'Default',
+        description: '推荐',
+        source: 'native' as const,
+        supportedEffortLevels: [],
+      },
+    ],
+    commands: [],
+    account: {},
+  };
+  f.server.store.append(first, randomUUID(), capabilities);
+  const second = await f.create(client);
+  assert.deepEqual(read(second), [capabilities]);
+  const { session } = f.server.store.get(second);
+  assert.equal(session.updatedAt, session.createdAt);
+});
+
 test('history is identical with negotiated compression and without compression', async (t) => {
   const f = await fixture(t);
   const owner = await f.connect();
@@ -1026,7 +1122,8 @@ test('forking copies a session whole or up to a message, and leaves the original
         event.payload.type === 'message.user' ? [event.payload.text] : [],
       );
   const original = f.server.store.get(sessionId).events.length;
-  const command = { type: 'session.fork', requestId: randomUUID(), sessionId };
+  // The client names the copy.
+  const command = { type: 'session.fork', requestId: randomUUID(), sessionId, title: '副本' };
   client.send(command);
   client.send(command);
   const copies = new Set<string>();
@@ -1042,16 +1139,17 @@ test('forking copies a session whole or up to a message, and leaves the original
   assert.notEqual(whole, sessionId);
   assert.deepEqual(questions(whole!), texts);
   const copy = f.server.store.get(whole!);
-  assert.equal(copy.session.title, `${f.server.store.get(sessionId).session.title}（分叉）`);
+  assert.equal(copy.session.title, '副本');
   assert.equal(copy.session.projectPath, f.server.store.get(sessionId).session.projectPath);
   assert.ok(
     copy.events.every((event, index) => event.sessionId === whole && event.sequence === index + 1),
   );
-  const cut = await client.request({ type: 'session.fork', sessionId, beforeMessageId: ids[2] });
+  const fork = { type: 'session.fork', sessionId, title: '分叉' } as const;
+  const cut = await client.request({ ...fork, beforeMessageId: ids[2] });
   assert.ok(cut.type === 'response' && cut.ok && cut.sessionId);
   assert.deepEqual(questions(cut.sessionId), texts.slice(0, 2));
   assert.equal(f.server.store.get(cut.sessionId).session.activeRun, null);
-  const first = await client.request({ type: 'session.fork', sessionId, beforeMessageId: ids[0] });
+  const first = await client.request({ ...fork, beforeMessageId: ids[0] });
   assert.ok(first.type === 'response' && first.ok && first.sessionId);
   assert.equal(f.server.store.get(first.sessionId).events.length, 0);
   // The fork continues on its own.
@@ -1064,15 +1162,11 @@ test('forking copies a session whole or up to a message, and leaves the original
   await completed(cut.sessionId);
   assert.deepEqual(questions(cut.sessionId), [...texts.slice(0, 2), '另一条路']);
   assert.equal(f.server.store.get(sessionId).events.length, original);
-  const missing = await client.request({
-    type: 'session.fork',
-    sessionId,
-    beforeMessageId: randomUUID(),
-  });
+  const missing = await client.request({ ...fork, beforeMessageId: randomUUID() });
   assert.ok(missing.type === 'response' && !missing.ok && missing.code === 'not_found');
   await client.request({ type: 'message.send', sessionId, text: '等待审批', scenario: 'tool' });
   await client.event('approval.requested');
-  const busy = await client.request({ type: 'session.fork', sessionId });
+  const busy = await client.request(fork);
   assert.ok(busy.type === 'response' && !busy.ok && busy.code === 'run_active');
 });
 
@@ -1133,10 +1227,14 @@ test('restart marks pending native sends unconfirmed and never queues them again
 test('native titles update only automatic names; a user rename remains authoritative', async (t) => {
   const f = await fixture(t);
   const requestId = randomUUID();
-  const automatic = f.server.store.create(requestId, '新会话', 'D:\\项目', device);
+  const automatic = f.server.store.create(requestId, '新会话', 'D:\\项目', device, false, true);
   assert.equal(automatic.autoTitle, true);
   f.server.store.renameNative(automatic.id, '原生标题');
-  assert.equal(f.server.store.create(requestId, '新会话', 'D:\\项目', device).id, automatic.id);
+  // A request sent again is the same one, though its placeholder may be another language's by then.
+  assert.equal(
+    f.server.store.create(requestId, 'New session', 'D:\\项目', device, false, true).id,
+    automatic.id,
+  );
   assert.throws(() => f.server.store.create(requestId, '不同请求', 'D:\\项目', device), {
     code: 'request_conflict',
   });
@@ -1278,14 +1376,20 @@ test('an upgrade is held back only by what is at work, and says what that is', (
     false,
     false,
   );
-  assert.match(held ?? '', /「在回答」「终端在跑」正在运行.*强行升级/);
-  assert.doesNotMatch(held ?? '', /终端开着|等后台任务/);
-  const many = Array.from({ length: 5 }, (_, index) => session(`会话${index}`, run));
-  assert.match(
-    upgradeHeld(many, false, false) ?? '',
-    /「会话0」「会话1」「会话2」 等 5 个会话正在运行/,
+  const text = (words: ReturnType<typeof upgradeHeld>) => (words ? textOf(words) : '');
+  assert.equal(
+    text(held),
+    '「在回答」「终端在跑」正在运行。升级会重启服务端并中断它们：等结束后再升级，或选择强行升级。',
   );
-  assert.match(upgradeHeld([], true, true) ?? '', /有会话正在移动或修改，Claude 账号正在登录/);
+  const many = Array.from({ length: 5 }, (_, index) => session(`会话${index}`, run));
+  assert.equal(
+    text(upgradeHeld(many, false, false)),
+    '「会话0」「会话1」「会话2」 等 5 个会话正在运行。升级会重启服务端并中断它们：等结束后再升级，或选择强行升级。',
+  );
+  assert.equal(
+    text(upgradeHeld([], true, true)),
+    '有会话正在移动或修改，Claude 账号正在登录。升级会重启服务端并中断它们：等结束后再升级，或选择强行升级。',
+  );
 });
 
 test('the projects are kept by the service, told to every window, and named or removed from any', async (t) => {
@@ -1442,4 +1546,60 @@ test('the quota is the account’s: a new connection is handed what the service 
   quotas.observeTerminal([{ name: 'five_hour', utilization: 13, resetsAt }]);
   for (const client of [first, late])
     assert.equal(used(await client.wait((message) => message.type === 'quota')), 13);
+});
+
+test('clients connected before the installer for clients has arrived are told of it once it has', async (t) => {
+  const version = serviceVersion();
+  const name = `CC-Desk-Tunnel-Setup-${version}-x64.exe`;
+  const installer = Buffer.alloc(5000, 7);
+  const sha256 = createHash('sha256').update(installer).digest('hex');
+  // The release page holds the installer back until the client has connected.
+  let release!: () => void;
+  const held = new Promise<void>((resolve) => (release = resolve));
+  const page = createHttpServer((request, response) => {
+    const base = `http://127.0.0.1:${(page.address() as AddressInfo).port}`;
+    if (request.url === `/repos/owner/name/releases/tags/v${version}`)
+      response.end(
+        JSON.stringify({
+          assets: [
+            { name: 'release.json', url: `${base}/assets/1` },
+            { name, url: `${base}/assets/2` },
+          ],
+        }),
+      );
+    else if (request.url === '/assets/1')
+      response.end(JSON.stringify({ version, files: [{ name, size: installer.length, sha256 }] }));
+    else if (request.url === '/assets/2') void held.then(() => response.end(installer));
+    else response.writeHead(404).end();
+  });
+  await new Promise<void>((resolve) => page.listen(0, '127.0.0.1', resolve));
+  const directory = mkdtempSync(join(tmpdir(), 'cc-desk-tunnel-test-'));
+  const server = createProxyServer({
+    token,
+    dataDir: directory,
+    updates: {
+      repository: 'owner/name',
+      api: `http://127.0.0.1:${(page.address() as AddressInfo).port}`,
+      restart: () => undefined,
+    },
+  });
+  const client = new Client(await server.listen(0));
+  t.after(async () => {
+    client.socket.terminate();
+    await server.close();
+    page.closeAllConnections();
+    page.close();
+    rmSync(directory, { recursive: true, force: true });
+  });
+  const ready = await client.open();
+  assert.ok(ready.type === 'ready' && ready.client === undefined);
+  release();
+  const told = await client.wait(
+    (message) => message.type === 'service.update' && !!message.client,
+  );
+  assert.deepEqual(told.type === 'service.update' && told.client, {
+    version,
+    size: installer.length,
+    sha256,
+  });
 });

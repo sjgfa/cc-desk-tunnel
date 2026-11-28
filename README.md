@@ -2,7 +2,7 @@
 
 <img src="apps/desktop/public/assets/icon-192.png" width="88" alt="CC Desk Tunnel 图标">
 
-> 本 fork 维护 macOS 原生服务适配和客户端修复，基线为上游 v0.3.19。详见 [Fork 维护说明](FORK.md)。
+> 本 fork 维护 macOS 原生服务适配和客户端修复，基线为上游 v0.3.22。详见 [Fork 维护说明](FORK.md)。
 
 # CC Desk Tunnel
 
@@ -97,8 +97,9 @@ Claude Code（简称 CC）运行在你自己的 Linux 服务器上，会话、�
 | 📱 **浏览器与手机** | 可选开启：操作在线电脑上的会话，或新建在服务端执行的普通会话；手机上可安装为应用；不增加端口或容器 |
 | 📊 **账号与用量** | 在客户端里登录、退出服务端的 Claude 账号，查看额度、重置时间和调用统计；提示缓存过期前可自动压缩 |
 | ⏰ **定时任务** | 到点由客户端向指定会话或新会话发送预设提示词，也可以直接让 Claude 帮你设置 |
-| ⬆️ **升级与备份** | 在客户端里点一下即可升级服务端和客户端，不必登录服务器；服务端一条命令备份与还原 |
+| ⬆️ **升级与备份** | 在客户端里一键升级服务端和 Windows 客户端，不必登录服务器；服务端一条命令备份与还原 |
 | 🧩 **省心** | 托盘后台、记住凭据与自动登录、未发送的内容按会话保存 |
+| 🌐 **界面语言** | 简体中文与英文，默认跟随系统，可在设置里切换；帮助全文和 `ccdt` 同样两种语言 |
 
 ## ⚙️ 工作方式
 
@@ -120,14 +121,14 @@ Claude Code（简称 CC）运行在你自己的 Linux 服务器上，会话、�
 **需要准备：**
 
 - 🐧 **服务器**：一台有公网 IP 或域名的 Linux 服务器，已装 Docker，推荐 Ubuntu；x86_64，arm64 为实验性支持。编译和测试都在你的电脑上跑，**2 核 1 GB 的入门机型就够**。
-- 💻 **电脑**：Windows 10 / 11 x64。macOS、Linux 的图形客户端和 `ccdt` 为实验性支持；没有图形界面的 Linux 用 `ccdt`。
+- 💻 **电脑**：Windows 10 / 11 x64、macOS 13 及以上（Apple 芯片或 Intel）或 Linux x64。macOS、Linux 的图形客户端和 `ccdt` 为实验性支持；没有图形界面的 Linux 用 `ccdt`。
 
 ### 1. 部署服务端
 
 在服务器上执行：
 
 ```sh
-sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/sun168567/cc-desk-tunnel/main/deploy/install.sh)"
+sudo bash -c "$(curl -fsSL https://github.com/sun168567/cc-desk-tunnel/releases/latest/download/install.sh)"
 ```
 
 一路回车即可。装完会打印客户端要填的**服务地址、证书指纹、服务凭据**，以及要在防火墙放行的端口（默认 TCP 8787，只有这一个）。以后在客户端的“设置 → 关于与更新”里就能升级服务端，一般不用再登录服务器。
@@ -159,7 +160,7 @@ sudo cc-desk-tunnel help      # 全部命令：更换凭据、备份恢复、证
 
 | | 适合 | 获取 |
 | --- | --- | --- |
-| 🖥️ **图形客户端** | 按项目管理各台电脑上的会话，过程折叠成摘要 | [最新发布页](https://github.com/sun168567/cc-desk-tunnel/releases/latest)开头的表格：Windows `.exe`；macOS `.dmg`、Linux `.deb`（实验性，见 [macOS](docs/macos.md) · [Linux](docs/linux.md)） |
+| 🖥️ **图形客户端** | 按项目管理各台电脑上的会话，过程折叠成摘要 | [最新发布页](https://github.com/sun168567/cc-desk-tunnel/releases/latest)开头的表格：Windows `.exe`；macOS Apple 芯片或 Intel 的 `.dmg`、Linux `.deb`（实验性，见 [macOS](docs/macos.md) · [Linux](docs/linux.md)） |
 | ⌨️ **终端客户端** | 即 `ccdt`：在自己的终端里用原版 Claude Code；也适合没有图形界面的机器 | 图形客户端已自带；只用终端时，单独安装用下面的命令 |
 
 Windows 安装包自带 PowerShell 7、OpenSSH 和 `ccdt`，不用另装任何东西；启动后填入上一步的三项信息并连接。
@@ -167,18 +168,18 @@ Windows 安装包自带 PowerShell 7、OpenSSH 和 `ccdt`，不用另装任何�
 <a id="杀毒软件与-smartscreen"></a>
 
 > [!NOTE]
-> 安装包没有代码签名。Windows 首次运行出现“Windows 已保护你的电脑”时，点“更多信息 → 仍要运行”；内置组件被安全软件拦截时先核对再放行，见[杀毒软件与 SmartScreen](docs/troubleshooting.md#杀毒软件与-smartscreen)。macOS 与 Linux 的客户端升级时需要重新下载安装。
+> Windows 安装包没有代码签名。首次运行出现“Windows 已保护你的电脑”时，点“更多信息 → 仍要运行”；内置组件被安全软件拦截时先核对再放行，见[杀毒软件与 SmartScreen](docs/troubleshooting.md#杀毒软件与-smartscreen)。macOS 客户端使用临时签名，未经过 Apple 公证。macOS 与 Linux 用户升级时需要重新下载安装包。
 
 单独安装 `ccdt`（只为当前用户安装，不需要管理员权限，装好后运行 `ccdt login`）：
 
 ```powershell
 # Windows（PowerShell）
-irm https://raw.githubusercontent.com/sun168567/cc-desk-tunnel/main/deploy/install-ccdt.ps1 | iex
+irm https://github.com/sun168567/cc-desk-tunnel/releases/latest/download/install-ccdt.ps1 | iex
 ```
 
 ```sh
 # macOS、Linux（实验性）
-curl -fsSL https://raw.githubusercontent.com/sun168567/cc-desk-tunnel/main/deploy/install-ccdt.sh | sh
+curl -fsSL https://github.com/sun168567/cc-desk-tunnel/releases/latest/download/install-ccdt.sh | sh
 ```
 
 脚本安装最新正式版并按 `SHA256SUMS` 校验；服务端不是最新版时，指定与它相同的版本，见[终端客户端](docs/cli.md#安装)。
@@ -255,6 +256,7 @@ npm ci
 npm run dev               # 本地模拟服务 + 浏览器界面，不需要任何账号
 npm test                  # 单元测试；另有 typecheck、test:ui、check
 npm run package:windows   # 生成 Windows 安装包，准备步骤见 apps/desktop/README.md
+npm run package:macos     # 在 Mac 上生成当前芯片的 DMG，输出到 artifacts/macos/
 npm run package:server    # 生成服务端程序包，传到服务器后运行其中的 deploy/install.sh
 ```
 

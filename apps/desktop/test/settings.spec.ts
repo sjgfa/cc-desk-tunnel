@@ -29,6 +29,7 @@ test('Claude Code settings load from the service and save each change at once', 
     includeGitInstructions: null,
     enableArtifact: null,
     toolSearch: null,
+    todoTools: null,
     denyInsteadOfPrompting: null,
     blockWritesOutsideWorkingDirectories: null,
   };
@@ -42,6 +43,7 @@ test('Claude Code settings load from the service and save each change at once', 
         send({
           type: 'ready',
           protocolVersion: PROTOCOL_VERSION,
+          serverDeviceId: '00000000-0000-4000-8000-000000000001',
           version: '0.0.1',
           connectionId: randomUUID(),
           adapter: 'claude-code',
@@ -147,6 +149,7 @@ test('the global CLAUDE.md is edited here and saved only over what was read', as
         send({
           type: 'ready',
           protocolVersion: PROTOCOL_VERSION,
+          serverDeviceId: '00000000-0000-4000-8000-000000000001',
           version: '0.0.1',
           connectionId: randomUUID(),
           adapter: 'claude-code',

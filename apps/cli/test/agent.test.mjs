@@ -1,3 +1,4 @@
+import './zh.mjs';
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { EventEmitter } from 'node:events';
@@ -75,7 +76,7 @@ async function fixture(t, stepMs = 2) {
     await service.request({ type: 'message.send', sessionId, text, scenario });
     return service;
   }
-  return { connect, run, send };
+  return { connect, run, send, server };
 }
 
 test('ccdt -p starts a session of this directory, waits for the turn and prints the reply', async (t) => {
@@ -180,6 +181,20 @@ test('questions are answered in order; a plan is sent back with what to change',
   assert.equal(await wait(planned.context, { json: true }, id), EXIT.needsYou);
   assert.equal(planned.json().approval.kind, 'plan');
   assert.match(planned.json().approval.plan, /计划：整理设置页/);
+  // Approved, the plan's steps are Claude Code's task list, which status shows.
+  assert.equal(await approve(f.run().context, { json: true }, id), EXIT.done);
+  const seen = f.run();
+  await status(seen.context, { json: true }, id);
+  assert.deepEqual(seen.json().tasks, [
+    { content: '读现有结构', status: 'in_progress' },
+    { content: '按计划修改', status: 'pending' },
+    { content: '补测试', status: 'pending' },
+  ]);
+  const told = f.run();
+  await status(told.context, {}, id);
+  assert.match(told.out.join('\n'), /任务清单：完成 0\/3，正在做：读现有结构/);
+  await f.send(id, 'plan');
+  assert.equal(await wait(f.run().context, { json: true }, id), EXIT.needsYou);
   const denied = f.run();
   assert.equal(await deny(denied.context, { json: true }, id, '先只改文档'), EXIT.done);
   assert.match(denied.json().result, /按你的意见继续规划/);
@@ -457,6 +472,30 @@ test('ccdt acp: a loaded session replays the newest page of its history', async 
   await Promise.all([client.served, loader.served]);
 });
 
+test('ccdt acp: a new session offers the models Claude Code last gave in any session, with no run of its own', async (t) => {
+  const f = await fixture(t);
+  const earlier = await f.connect();
+  const made = await earlier.request({ type: 'session.create', title: '先前', projectPath: here });
+  f.server.store.append(made.sessionId, randomUUID(), {
+    type: 'native.capabilities',
+    models: [
+      { value: 'default', displayName: 'Default', description: '', supportedEffortLevels: [] },
+      { value: 'haiku', displayName: 'Haiku', description: '', supportedEffortLevels: [] },
+    ],
+    commands: [],
+    account: {},
+  });
+  const client = acpClient(f, () => ({ outcome: 'cancelled' }));
+  await client.request('initialize', { protocolVersion: 1, clientCapabilities: {} });
+  const created = await client.request('session/new', { cwd: here, mcpServers: [] });
+  assert.deepEqual(
+    created.result.configOptions[0].options.map((option) => option.value),
+    ['default', 'haiku'],
+  );
+  client.end();
+  await client.served;
+});
+
 test('ccdt acp: the models Claude Code offers are chosen in the client, with how hard the one chosen reasons', async (t) => {
   const f = await fixture(t);
   const client = acpClient(f, () => ({ outcome: 'cancelled' }));
@@ -589,4 +628,33 @@ test('with -p, -r takes the session it continues, as claude -p’s does; alone i
   ]);
   assert.deepEqual(printing(['-r']), ['-r']);
   assert.deepEqual(printing(['-r', '--all']), ['-r', '--all']);
+});
+
+test('ccdt acp: Claude Code’s task list is the session’s plan, given whole each time it changes', async (t) => {
+  const f = await fixture(t);
+  const client = acpClient(f, () => ({ outcome: 'cancelled' }));
+  await client.request('initialize', { protocolVersion: 1, clientCapabilities: {} });
+  const created = await client.request('session/new', { cwd: here, mcpServers: [] });
+  const sessionId = created.result.sessionId;
+  let sequence = 2000;
+  const event = (payload) =>
+    client.made[0].emit('message', {
+      type: 'session.event',
+      event: { sessionId, sequence: sequence++, payload },
+    });
+  const call = (toolId, name, input, output) => {
+    event({ type: 'tool.requested', toolId, name, input: JSON.stringify(input), target: 'Linux' });
+    event({ type: 'tool.result', toolId, status: 'completed', output, exitCode: null });
+  };
+  call('a', 'TaskCreate', { subject: '读代码' }, 'Task #1 created successfully: 读代码');
+  call('b', 'TaskCreate', { subject: '改代码' }, 'Task #2 created successfully: 改代码');
+  call('c', 'TaskUpdate', { taskId: '1', status: 'in_progress' }, 'Updated task #1 status');
+  const plans = () => client.updates(sessionId).filter((update) => update.sessionUpdate === 'plan');
+  while (plans().length < 3) await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.deepEqual(plans().at(-1).entries, [
+    { content: '读代码', priority: 'medium', status: 'in_progress' },
+    { content: '改代码', priority: 'medium', status: 'pending' },
+  ]);
+  client.end();
+  await client.served;
 });

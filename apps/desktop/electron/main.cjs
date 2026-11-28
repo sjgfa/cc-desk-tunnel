@@ -35,9 +35,10 @@ const { asOnDisk } = require('./disk-path.cjs');
 const { openLog } = require('./client-log.cjs');
 const { hostname, tmpdir } = require('node:os');
 const { randomUUID } = require('node:crypto');
-const { spawn } = require('node:child_process');
-const { mkdir, readdir, rmdir, unlink } = require('node:fs/promises');
+const { execFile, spawn } = require('node:child_process');
+const { mkdir, readdir, rm, rmdir, unlink } = require('node:fs/promises');
 const { pathToFileURL } = require('node:url');
+const { promisify } = require('node:util');
 let bridge;
 // The last connection, kept for its installer download after a service refused this client's version.
 let lastBridge;
@@ -112,7 +113,7 @@ app.on('activate', showWindow);
 // Window preferences and the optional saved sign-in live in the user's profile, outside the install directory.
 // A connection's files are in its directory (see connections.cjs).
 const own = () => {
-  if (!connectionId) throw new Error('还没有登录服务。');
+  if (!connectionId) throw new Error(t('desktop:error.notSignedIn'));
   return connections.directory(base, connectionId);
 };
 const settingsPath = () => path.join(own(), 'settings.json');
@@ -155,17 +156,27 @@ function keepAwake(on) {
 }
 
 // These channels answer only the application's own page.
+// The words outside the page (words.mjs), in the window's language: loaded with the connection bridge, whose
+// bundle holds them, before the first window opens.
+let words = null;
+const t = (...args) => words.t(...args);
+// A request of the page. What a failure says reaches it in words: a phrase is said here.
 function handle(channel, listener) {
-  ipcMain.handle(channel, (event, ...args) => {
+  ipcMain.handle(channel, async (event, ...args) => {
     if (!event.senderFrame.url.startsWith('file://')) throw new Error('Untrusted renderer');
-    return listener(event, ...args);
+    try {
+      return await listener(event, ...args);
+    } catch (error) {
+      if (!error?.phrase) throw error;
+      throw Object.assign(new Error(words.failureText(error)), { cancelled: error.cancelled });
+    }
   });
 }
 
 handle('project:choose', async (event) => {
   const window = BrowserWindow.fromWebContents(event.sender);
   const result = await dialog.showOpenDialog(window, {
-    title: '添加项目',
+    title: t('desktop:dialog.addProject'),
     properties: ['openDirectory'],
   });
   return result.canceled ? null : (result.filePaths[0] ?? null);
@@ -185,7 +196,7 @@ handle('folders:exist', (_event, folders) =>
 // Files the user wants to mention in a message: only their paths go to the page.
 handle('files:choose', async (event) => {
   const result = await dialog.showOpenDialog(BrowserWindow.fromWebContents(event.sender), {
-    title: '添加文件',
+    title: t('desktop:dialog.addFiles'),
     properties: ['openFile', 'multiSelections'],
   });
   return result.canceled ? [] : result.filePaths;
@@ -203,7 +214,7 @@ const pictureTypes = {
 handle('image:save', async (_event, type, bytes) => {
   const extension = pictureTypes[String(type)];
   if (!extension || !(bytes instanceof Uint8Array) || !bytes.length || bytes.length > 20 << 20)
-    throw new Error('只能粘贴不超过 20 MB 的图片。');
+    throw new Error(t('desktop:error.imageTooLarge'));
   await mkdir(pastedDirectory(), { recursive: true });
   const stamp = new Date().toISOString().replace(/[-:]/g, '').replace('T', '-').slice(0, 15);
   const target = path.join(pastedDirectory(), `${stamp}-${randomUUID().slice(0, 6)}.${extension}`);
@@ -220,7 +231,7 @@ async function clearPastedPictures() {
 // Writes text the page produced (an exported session) where the user chooses.
 handle('file:save', async (event, name, text) => {
   const result = await dialog.showSaveDialog(BrowserWindow.fromWebContents(event.sender), {
-    title: '导出',
+    title: t('desktop:dialog.export'),
     defaultPath: path.join(app.getPath('downloads'), path.basename(String(name))),
     filters: [{ name: 'Markdown', extensions: ['md'] }],
   });
@@ -230,7 +241,7 @@ handle('file:save', async (event, name, text) => {
 });
 handle('folder:open', async (_event, directory) => {
   const target = path.resolve(String(directory));
-  if (!(await stat(target)).isDirectory()) throw new Error('不是文件夹。');
+  if (!(await stat(target)).isDirectory()) throw new Error(t('desktop:error.notFolder'));
   const failure = await shell.openPath(target);
   if (failure) throw new Error(failure);
 });
@@ -259,7 +270,7 @@ async function panel() {
       bridge: current,
       files: createFiles({
         open: () => {
-          if (!current || bridge !== current) throw new Error('还没有连上服务。');
+          if (!current || bridge !== current) throw new Error(t('desktop:error.notConnected'));
           return current.openFiles();
         },
       }),
@@ -282,7 +293,7 @@ handle('panel:home', async (_event, target) => (await panel()).home(text(target)
 // Where to save what is downloaded from the panel.
 handle('panel:choose-folder', async (event) => {
   const result = await dialog.showOpenDialog(BrowserWindow.fromWebContents(event.sender), {
-    title: '选择保存位置',
+    title: t('desktop:dialog.saveWhere'),
     properties: ['openDirectory', 'createDirectory'],
   });
   return result.canceled ? null : (result.filePaths[0] ?? null);
@@ -323,6 +334,10 @@ handle('panel:transfer', async (event, id, request) => {
         if (!event.sender.isDestroyed()) event.sender.send('panel:progress', id, report);
       },
     });
+  } catch (error) {
+    // A transfer the panel stopped did not fail.
+    if (error?.cancelled) return { files: 0, bytes: 0, cancelled: true };
+    throw error;
   } finally {
     transfers.delete(id);
   }
@@ -394,7 +409,12 @@ async function linkedPath(target) {
 }
 handle('path:inspect', async (_event, target) => {
   const { kind, runs } = await linkedPath(target);
-  return { kind, runs, editors: linkEditors(), openWith: process.platform === 'win32' };
+  return {
+    kind,
+    runs,
+    editors: linkEditors(),
+    openWith: ['win32', 'darwin'].includes(process.platform),
+  };
 });
 handle('path:act', async (event, action, target, options) => {
   const { file, kind, runs, size } = await linkedPath(target);
@@ -402,10 +422,10 @@ handle('path:act', async (event, action, target, options) => {
   const position = [line, column].map((value) =>
     Number.isInteger(value) && value > 0 ? value : undefined,
   );
-  if (kind === 'missing') return '本机找不到这个路径，它可能在服务端或另一台电脑上。';
+  if (kind === 'missing') return t('desktop:open.missing');
   const open = async () => {
     const failure = await shell.openPath(file);
-    return failure ? `没能打开：${failure}` : '';
+    return failure ? t('desktop:open.failed', { reason: failure }) : '';
   };
   const edit = async (chosen) => {
     await shell.openExternal(fileLinks.editorUrl(chosen.scheme, file, ...position));
@@ -416,7 +436,7 @@ handle('path:act', async (event, action, target, options) => {
     if (kind === 'file' && position[0] && first) return edit(first);
     if (!runs) return open();
     shell.showItemInFolder(file);
-    return '它会运行程序，没有直接打开，已在文件夹中显示。';
+    return t('desktop:open.program');
   }
   if (action === 'reveal') {
     shell.showItemInFolder(file);
@@ -430,23 +450,34 @@ handle('path:act', async (event, action, target, options) => {
     return edit(chosen);
   }
   if (action === 'content') {
-    if (size > 1024 * 1024) return '文件超过 1 MB，没有复制。';
+    if (size > 1024 * 1024) return t('desktop:open.tooLarge');
     const bytes = await readFile(file);
-    if (bytes.includes(0)) return '这不是文本文件，没有复制。';
+    if (bytes.includes(0)) return t('desktop:open.notText');
     clipboard.writeText(bytes.toString('utf8'));
-    return '已复制文件内容';
+    return t('desktop:open.copied');
   }
   if (action === 'save') {
     const result = await dialog.showSaveDialog(BrowserWindow.fromWebContents(event.sender), {
-      title: '另存为',
+      title: t('desktop:dialog.saveAs'),
       defaultPath: path.join(app.getPath('downloads'), path.basename(file)),
     });
     if (result.canceled || !result.filePath) return '';
     await copyFile(file, result.filePath);
-    return '已另存';
+    return t('desktop:open.saved');
   }
   if (runs) throw new Error('Refused to run');
   if (action === 'default') return open();
+  if (action === 'with' && process.platform === 'darwin') {
+    const result = await dialog.showOpenDialog(BrowserWindow.fromWebContents(event.sender), {
+      title: t('desktop:dialog.openWith', { name: path.basename(file) }),
+      defaultPath: '/Applications',
+      properties: ['openFile'],
+      filters: [{ name: t('desktop:dialog.applications'), extensions: ['app'] }],
+    });
+    if (result.canceled || !result.filePaths.length) return '';
+    await promisify(execFile)('/usr/bin/open', ['-a', result.filePaths[0], file]);
+    return '';
+  }
   if (action === 'with' && process.platform === 'win32') {
     const chooser = path.join(process.env.SystemRoot ?? 'C:\\Windows', 'System32', 'OpenWith.exe');
     spawn(chooser, [file], { detached: true, stdio: 'ignore' })
@@ -490,7 +521,7 @@ handle('workspace:choose', async (event, reset) => {
   let chosen = defaultRoot();
   if (reset !== true) {
     const result = await dialog.showOpenDialog(BrowserWindow.fromWebContents(event.sender), {
-      title: '普通会话的文件夹',
+      title: t('desktop:dialog.plainFolder'),
       properties: ['openDirectory', 'createDirectory'],
     });
     if (result.canceled || !result.filePaths[0]) return workspaceRoots();
@@ -595,7 +626,7 @@ handle('service:upgrade', async (event, config) => {
     },
   ).then(
     (version) => ({ version }),
-    (error) => ({ error: error.message, code: error.code }),
+    (error) => ({ error: error.message, phrase: error.phrase, code: error.code }),
   );
 });
 // The ccdt this client's package carries.
@@ -761,7 +792,7 @@ handle('launcher:start', async (event, form) => {
     return {};
   }
   const token = String(form?.token ?? '').trim() || (found ? await savedToken(found.id) : '');
-  if (!token) return { error: '请输入服务凭据。' };
+  if (!token) return { error: t('desktop:error.noToken') };
   if (mainWindow) return {};
   let id = found?.id;
   if (!id) id = connections.create(base, login);
@@ -778,7 +809,7 @@ handle('launcher:start', async (event, form) => {
   });
   window.webContents.on('render-process-gone', () => {
     if (!entered && mainWindow === window)
-      endAttempt({ status: 'disconnected', error: '连接窗口意外退出，请再试一次。' });
+      endAttempt({ status: 'disconnected', error: t('desktop:error.windowExited') });
   });
   return {};
 });
@@ -982,11 +1013,20 @@ function takeShared() {
     if (text === seen[key]) continue;
     seen[key] = text;
     if (key === 'connections') renamed();
-    if (key === 'prefs') followTheme(value);
+    if (key === 'prefs') {
+      followTheme(value);
+      followLanguage(value);
+    }
     for (const window of BrowserWindow.getAllWindows())
       window.webContents.send('shared:changed', key, value);
   }
 }
+// The system's languages, most preferred first, which the window's language follows unless one is chosen in
+// the settings (packages/i18n `resolveLanguage`). Chromium's `--lang` sets the language for one run.
+const systemLanguages = () => {
+  const chosen = app.commandLine.getSwitchValue('lang');
+  return chosen ? [chosen] : app.getPreferredSystemLanguages();
+};
 // What the page needs before it draws anything.
 ipcMain.on('boot', (event) => {
   event.returnValue = event.senderFrame.url.startsWith('file://')
@@ -994,6 +1034,7 @@ ipcMain.on('boot', (event) => {
         connection: event.sender === mainWindow?.webContents ? connectionId : '',
         launcher: event.sender !== mainWindow?.webContents,
         shared: Object.fromEntries(Object.keys(seen).map((key) => [key, snapshot(key)])),
+        languages: systemLanguages(),
       }
     : null;
 });
@@ -1004,7 +1045,10 @@ handle('shared:save', (_event, key, value) => {
   if (text.length > 1 << 20) throw new Error('Shared value too large');
   connections.writeShared(base, key, value);
   seen[key] = text;
-  if (key === 'prefs') followTheme(value);
+  if (key === 'prefs') {
+    followTheme(value);
+    followLanguage(value);
+  }
 });
 // The project list from before the service kept them, for this connection to hand over (see connections.cjs).
 handle('projects:legacy', () =>
@@ -1025,6 +1069,61 @@ function followTheme(prefs) {
   nativeTheme.themeSource = theme === 'light' || theme === 'dark' ? theme : 'system';
 }
 followTheme(seen.prefs && JSON.parse(seen.prefs));
+// The language of the menus, dialogs and failures follows the window's (see words.mjs); what is already built
+// is built again in it.
+function followLanguage(prefs) {
+  if (!words?.followLanguage(prefs?.language, systemLanguages())) return;
+  applicationMenu();
+  refreshTray();
+}
+// Shortcuts are the page's, where the user can change them or turn them off; Electron's default menu would
+// add its own on top (zoom, reload, close). A run from source keeps reload and the developer tools.
+// macOS has one menu bar for every program and takes the keys of copying, pasting, hiding and quitting from
+// what is in it: without these entries they do nothing. The page's own menus stay in its title bar.
+function applicationMenu() {
+  const development = app.isPackaged
+    ? []
+    : [
+        {
+          label: t('desktop:menu.develop'),
+          submenu: [{ role: 'reload' }, { role: 'toggleDevTools' }],
+        },
+      ];
+  Menu.setApplicationMenu(
+    process.platform === 'darwin'
+      ? Menu.buildFromTemplate([
+          {
+            label: app.name,
+            submenu: [
+              { role: 'about', label: t('desktop:menu.about') },
+              { type: 'separator' },
+              { role: 'hide', label: t('desktop:menu.hide') },
+              { role: 'hideOthers', label: t('desktop:menu.hideOthers') },
+              { role: 'unhide', label: t('desktop:menu.unhide') },
+              { type: 'separator' },
+              { role: 'quit', label: t('desktop:menu.quit') },
+            ],
+          },
+          {
+            label: t('desktop:menu.edit'),
+            submenu: [
+              { role: 'undo', label: t('desktop:menu.undo') },
+              { role: 'redo', label: t('desktop:menu.redo') },
+              { type: 'separator' },
+              { role: 'cut', label: t('desktop:menu.cut') },
+              { role: 'copy', label: t('desktop:menu.copy') },
+              { role: 'paste', label: t('desktop:menu.paste') },
+              { role: 'selectAll', label: t('desktop:menu.selectAll') },
+            ],
+          },
+          { role: 'windowMenu', label: t('desktop:menu.window') },
+          ...development,
+        ])
+      : development.length
+        ? Menu.buildFromTemplate(development)
+        : null,
+  );
+}
 nativeTheme.on('updated', () => {
   const colours = windowColours();
   for (const window of BrowserWindow.getAllWindows()) {
@@ -1048,7 +1147,7 @@ handle('accounts:list', listed);
 // Opened from the settings or the tray: signs in with its remembered token, if it has one.
 handle('accounts:open', (_event, id) => {
   if (!connections.list(base).some((entry) => entry.id === id))
-    throw new Error('这个连接已不存在。');
+    throw new Error(t('desktop:error.connectionGone'));
   launch(id);
 });
 handle('accounts:rename', (_event, id, name) => {
@@ -1058,7 +1157,7 @@ handle('accounts:rename', (_event, id, name) => {
 });
 // Forgetting a service forgets its connection with what it kept here: see `remove` in connections.cjs.
 handle('accounts:forget', (_event, id) => {
-  if (id === connectionId) throw new Error('不能删除正在使用的连接。');
+  if (id === connectionId) throw new Error(t('desktop:error.connectionInUse'));
   connections.remove(base, String(id));
   takeShared();
   return listed();
@@ -1107,44 +1206,96 @@ handle('notify:show', (event, notice) => {
 });
 // Upgrades in place: the installer runs silently over the current install and starts the new version. It
 // comes from the connected service, or, when the user chooses so, straight from the release page: `version`
-// is then the one to fetch, which the service's refusal of this client named.
+// is then the one to fetch, which the service's refusal of this client named. One upgrade runs at a time; the
+// window hears each step on `update:progress`, bytes as they come and the steps between them, and can stop the
+// download with `update:cancel`.
+let upgrading = null;
+handle('update:cancel', () => upgrading?.abort());
 handle('update:install', async (event, version) => {
-  if (!app.isPackaged) throw new Error('源码运行不支持自升级；请重新打包安装。');
+  if (!app.isPackaged) throw new Error(t('desktop:upgrade.fromSource'));
   // Only the Windows installer can be run over an installation. Elsewhere the user installs a new package.
-  if (process.platform !== 'win32')
-    throw new Error('这个系统上的客户端不能在应用内升级，请到发布页下载新版本。');
+  if (process.platform !== 'win32') throw new Error(t('desktop:upgrade.unsupported'));
+  if (upgrading) throw new Error(t('desktop:upgrade.already'));
+  if (version === undefined && !lastBridge) throw new Error(t('desktop:upgrade.connectFirst'));
   const directory = await mkdtemp(path.join(tmpdir(), 'cc-desk-tunnel-update-'));
-  let installer;
-  if (version === undefined) {
-    if (!lastBridge) throw new Error('请先连接服务。');
-    installer = await lastBridge.downloadInstaller(directory);
-  } else {
-    const { downloadRelease } = await import(
-      pathToFileURL(path.join(__dirname, 'release-download.mjs')).href
-    );
-    let told = 0;
-    // Chromium's network stack: the Windows proxy settings apply, as they do to the connection itself.
-    installer = await downloadRelease((url, init) => net.fetch(url, init), version, directory, {
-      announced: lastBridge?.release(),
-      progress(received, size) {
-        if (Date.now() - told < 500 && received < size) return;
-        told = Date.now();
-        if (!event.sender.isDestroyed()) event.sender.send('update:progress', { received, size });
-      },
-    });
+  const controller = (upgrading = new AbortController());
+  const source = version === undefined ? 'service' : 'github';
+  let told = 0;
+  const tell = (step) => {
+    if (step.phase === 'downloading') {
+      if (Date.now() - told < 400 && step.received < step.size) return;
+      told = Date.now();
+    }
+    // Why a connection is tried again may be a phrase, which is said here.
+    if (step.reason !== undefined) step = { ...step, reason: words.say(step.reason) };
+    if (!event.sender.isDestroyed()) event.sender.send('update:progress', { source, ...step });
+  };
+  const progress = (received, size) => tell({ phase: 'downloading', received, size });
+  try {
+    tell({ phase: 'connecting' });
+    let installer;
+    if (version === undefined)
+      installer = await lastBridge.downloadInstaller(directory, {
+        progress,
+        signal: controller.signal,
+      });
+    else {
+      const { downloadRelease } = await import(
+        pathToFileURL(path.join(__dirname, 'release-download.mjs')).href
+      );
+      // Chromium's network stack: the Windows proxy settings apply, as they do to the connection itself.
+      installer = await downloadRelease((url, init) => net.fetch(url, init), version, directory, {
+        announced: lastBridge?.release(),
+        progress,
+        report: tell,
+        signal: controller.signal,
+      });
+    }
+    // The installer replaces the program under every connection's window, so the others go first.
+    if (others().some((entry) => connections.running(base, entry.id))) {
+      tell({ phase: 'closing' });
+      dismissOthers();
+    }
+    for (
+      let waited = 0;
+      others().some((entry) => connections.running(base, entry.id));
+      waited += 250
+    ) {
+      if (waited >= 15000) throw new Error(t('desktop:upgrade.othersOpen'));
+      await new Promise((resolve) => setTimeout(resolve, 250));
+    }
+    tell({ phase: 'installing' });
+    // The window shows that step for a moment; the installer then starts and this client quits at once, as the
+    // installer expects of the program it replaces.
+    await new Promise((resolve) => setTimeout(resolve, 800));
+    spawn(installer, ['/S', '--force-run'], { detached: true, stdio: 'ignore' }).unref();
+  } catch (error) {
+    await rm(directory, { recursive: true, force: true }).catch(() => {});
+    if (error?.cancelled) return { cancelled: true };
+    throw error;
+  } finally {
+    upgrading = null;
   }
-  // The installer replaces the program under every connection's window, so the others go first.
-  dismissOthers();
-  for (
-    let waited = 0;
-    others().some((entry) => connections.running(base, entry.id));
-    waited += 250
-  ) {
-    if (waited >= 15000) throw new Error('其他连接的窗口没有退出，请先退出它们再升级。');
-    await new Promise((resolve) => setTimeout(resolve, 250));
-  }
-  spawn(installer, ['/S', '--force-run'], { detached: true, stdio: 'ignore' }).unref();
+  // The installer works for a while with no window of its own: the system's notification says what goes on.
+  if (Notification.isSupported())
+    new Notification({
+      title: t('desktop:upgrade.title'),
+      body: t('desktop:upgrade.body'),
+      icon: path.join(__dirname, 'icon.png'),
+    }).show();
   app.quit();
+  return {};
+});
+// The sign-in window asks a service that refused this client what it says now (see probeService), with the token
+// its sign-in used.
+handle('service:probe', async (_event, config) => {
+  const { probeService } = await import(
+    pathToFileURL(path.join(__dirname, 'proxy-bridge.mjs')).href
+  );
+  return probeService(
+    { ...config, token: config?.token || attemptToken },
+    { resolveProxy: (url) => session.defaultSession.resolveProxy(url) },
+  );
 });
 async function closeBridge() {
   keepAwake(false);
@@ -1219,17 +1370,17 @@ function createWindow(partition, { width, height, shown }) {
   window.webContents.on('context-menu', (_event, params) => {
     if (!params.isEditable) {
       if (params.selectionText)
-        Menu.buildFromTemplate([{ role: 'copy', label: '复制' }]).popup({ window });
+        Menu.buildFromTemplate([{ role: 'copy', label: t('desktop:menu.copy') }]).popup({ window });
       return;
     }
     Menu.buildFromTemplate([
-      { role: 'undo', label: '撤销', enabled: params.editFlags.canUndo },
-      { role: 'redo', label: '重做', enabled: params.editFlags.canRedo },
+      { role: 'undo', label: t('desktop:menu.undo'), enabled: params.editFlags.canUndo },
+      { role: 'redo', label: t('desktop:menu.redo'), enabled: params.editFlags.canRedo },
       { type: 'separator' },
-      { role: 'cut', label: '剪切', enabled: params.editFlags.canCut },
-      { role: 'copy', label: '复制', enabled: params.editFlags.canCopy },
-      { role: 'paste', label: '粘贴', enabled: params.editFlags.canPaste },
-      { role: 'selectAll', label: '全选' },
+      { role: 'cut', label: t('desktop:menu.cut'), enabled: params.editFlags.canCut },
+      { role: 'copy', label: t('desktop:menu.copy'), enabled: params.editFlags.canCopy },
+      { role: 'paste', label: t('desktop:menu.paste'), enabled: params.editFlags.canPaste },
+      { role: 'selectAll', label: t('desktop:menu.selectAll') },
     ]).popup({ window });
   });
   window.webContents.on('will-navigate', (event) => event.preventDefault());
@@ -1273,10 +1424,10 @@ function attend(window) {
     tray.setContextMenu(
       Menu.buildFromTemplate([
         // Each connection's icon is its own window's: it neither opens nor quits the others.
-        { label: '显示窗口', click: showWindow },
-        { label: '新的登录窗口', click: () => launch(null) },
+        { label: t('desktop:tray.show'), click: showWindow },
+        { label: t('desktop:tray.newLogin'), click: () => launch(null) },
         {
-          label: '关闭窗口时留在后台',
+          label: t('desktop:tray.stayInBackground'),
           type: 'checkbox',
           checked: closeToTray(),
           click: (item) => {
@@ -1285,7 +1436,7 @@ function attend(window) {
           },
         },
         { type: 'separator' },
-        { label: '退出', click: () => app.quit() },
+        { label: t('desktop:tray.quit'), click: () => app.quit() },
       ]),
     );
   tray.on('click', showWindow);
@@ -1308,8 +1459,8 @@ function attend(window) {
       // Balloons are a thing of the Windows tray.
       if (process.platform === 'win32')
         tray.displayBalloon({
-          title: 'CC Desk Tunnel 仍在后台运行',
-          content: '点击托盘图标恢复窗口；右键图标选择“退出”才会结束连接。',
+          title: t('desktop:tray.backgroundTitle'),
+          content: t('desktop:tray.backgroundBody'),
         });
     }
   });
@@ -1325,6 +1476,8 @@ app.whenReady().then(async () => {
     (await connections.tell(base, requested.id, 'show'))
   )
     return app.exit(0);
+  words = await import(pathToFileURL(path.join(__dirname, 'proxy-bridge.mjs')).href);
+  followLanguage(seen.prefs && JSON.parse(seen.prefs));
   log(`Client ${app.getVersion()} started.`);
   for (const problem of startProblems) log(`Profile upkeep failed: ${problem.message}`);
   // On macOS and Linux the ccdt this client carries becomes the user's ccdt (see linkCcdt); the Windows installer
@@ -1344,47 +1497,7 @@ app.whenReady().then(async () => {
       })
       .catch((error) => log(`ccdt command not linked: ${error.message}`));
   setInterval(takeShared, 2000);
-  // Shortcuts are the page's, where the user can change them or turn them off; Electron's default menu would
-  // add its own on top (zoom, reload, close). A run from source keeps reload and the developer tools.
-  // macOS has one menu bar for every program and takes the keys of copying, pasting, hiding and quitting from
-  // what is in it: without these entries they do nothing. The page's own menus stay in its title bar.
-  const development = app.isPackaged
-    ? []
-    : [{ label: '开发', submenu: [{ role: 'reload' }, { role: 'toggleDevTools' }] }];
-  Menu.setApplicationMenu(
-    process.platform === 'darwin'
-      ? Menu.buildFromTemplate([
-          {
-            label: app.name,
-            submenu: [
-              { role: 'about', label: '关于 CC Desk Tunnel' },
-              { type: 'separator' },
-              { role: 'hide', label: '隐藏 CC Desk Tunnel' },
-              { role: 'hideOthers', label: '隐藏其他' },
-              { role: 'unhide', label: '全部显示' },
-              { type: 'separator' },
-              { role: 'quit', label: '退出 CC Desk Tunnel' },
-            ],
-          },
-          {
-            label: '编辑',
-            submenu: [
-              { role: 'undo', label: '撤销' },
-              { role: 'redo', label: '重做' },
-              { type: 'separator' },
-              { role: 'cut', label: '剪切' },
-              { role: 'copy', label: '复制' },
-              { role: 'paste', label: '粘贴' },
-              { role: 'selectAll', label: '全选' },
-            ],
-          },
-          { role: 'windowMenu', label: '窗口' },
-          ...development,
-        ])
-      : development.length
-        ? Menu.buildFromTemplate(development)
-        : null,
-  );
+  applicationMenu();
   session.defaultSession.setPermissionRequestHandler((_contents, _permission, callback) =>
     callback(false),
   );

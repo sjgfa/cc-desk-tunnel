@@ -9,6 +9,8 @@
 !apps/server/src/**
 !apps/server/web/
 !apps/server/web/**
+!apps/server/help/
+!apps/server/help/**
 !apps/desktop/
 !apps/desktop/package.json
 !apps/desktop/index.html
@@ -20,12 +22,17 @@
 !apps/desktop/public/
 !apps/desktop/public/**
 !packages/
+!packages/i18n/
+!packages/i18n/package.json
+!packages/i18n/src/
+!packages/i18n/src/**
 !packages/protocol/
 !packages/protocol/package.json
 !packages/protocol/src/
 !packages/protocol/src/**
 !scripts/
 !scripts/install-linux.sh
+!scripts/help-markdown.mjs
 !deploy/
 !deploy/docker/
 !deploy/docker/Dockerfile

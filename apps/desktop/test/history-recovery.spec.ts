@@ -82,7 +82,8 @@ test('stale tools stop spinning, stalled history can pause and retry without res
         return send({
           type: 'ready',
           protocolVersion: PROTOCOL_VERSION,
-          version: '0.3.19',
+          serverDeviceId: '00000000-0000-4000-8000-000000000001',
+          version: '0.3.22',
           adapter: 'simulation',
           connectionId,
           projects: [],

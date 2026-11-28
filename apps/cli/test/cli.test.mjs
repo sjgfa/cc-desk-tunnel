@@ -1,3 +1,4 @@
+import './zh.mjs';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
 import {
@@ -11,7 +12,7 @@ import {
   writeFileSync,
 } from 'node:fs';
 import { createHash } from 'node:crypto';
-import { execFileSync, spawnSync } from 'node:child_process';
+import { execFileSync, spawn, spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { PassThrough } from 'node:stream';
@@ -37,6 +38,34 @@ test('settings live where each system keeps them, beside the desktop client’s'
   );
   assert.equal(directories({}, 'linux', '/h').desktop, join('/h', '.config', 'CC Desk Tunnel'));
   assert.equal(directories({ CCDT_CONFIG_DIR: '/c' }, 'linux', '/h').cli, '/c');
+});
+
+// Agents run several ccdt at once, and each one notes the service it used. On Windows, a file being replaced by one
+// process cannot be replaced by another in the same instant.
+test('several ccdt saving their settings at once all succeed and leave whole settings', async (t) => {
+  const root = mkdtempSync(join(tmpdir(), 'ccdt-config-'));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const paths = { cli: join(root, 'cli'), desktop: join(root, 'desktop') };
+  new Config(paths).remember({ url: 'wss://a/ws', fingerprint: '' });
+  const module = new URL('../src/config.mjs', import.meta.url).href;
+  const script = `const { Config } = await import(${JSON.stringify(module)});
+for (let i = 0; i < 40; i++) new Config(${JSON.stringify(paths)}).use('wss://a/ws');`;
+  const codes = await Promise.all(
+    Array.from(
+      { length: 8 },
+      () =>
+        new Promise((resolve) => {
+          const child = spawn(process.execPath, ['--input-type=module', '-e', script], {
+            stdio: ['ignore', 'ignore', 'pipe'],
+          });
+          let error = '';
+          child.stderr.on('data', (data) => (error += data));
+          child.on('exit', (code) => resolve(code ? error : 0));
+        }),
+    ),
+  );
+  assert.deepEqual(codes, Array(8).fill(0));
+  assert.equal(new Config(paths).server().url, 'wss://a/ws');
 });
 
 test('the desktop client’s device ID is the computer’s; without one ccdt keeps its own', (t) => {
@@ -480,6 +509,7 @@ test('ccdt’s settings: its own waits, the service’s and Claude Code’s with
       fastMode: null,
       fallbackModel: ['sonnet'],
       toolSearch: null,
+      todoTools: null,
     },
     web: { enabled: true, url: 'https://work.example.com/desk/' },
   };
@@ -527,6 +557,22 @@ test('ccdt’s settings: its own waits, the service’s and Claude Code’s with
   await save(named('connection.connect'), null, { config, service });
   await save(named('connection.ready'), 90, { config, service });
   assert.deepEqual(JSON.parse(readFileSync(config.path, 'utf8')).waits, { ready: 90 });
+  // ccdt's language is its own too, the system's until one is chosen, and is taken at once.
+  assert.equal(shown(named('ccdt.language')), '跟随系统');
+  assert.deepEqual(choices(named('ccdt.language')), [
+    [null, '跟随系统'],
+    ['zh-CN', '简体中文'],
+    ['en', 'English'],
+  ]);
+  assert.equal(parse(named('ccdt.language'), 'EN'), 'en');
+  assert.equal(parse(named('ccdt.language'), 'default'), null);
+  await save(named('ccdt.language'), 'en', { config, service });
+  assert.equal(new Config(config.paths).language, 'en');
+  assert.equal(shown(entries({ language: 'en' })[0]), 'English');
+  assert.equal(entries()[0].title, 'ccdt language');
+  await save(named('ccdt.language'), null, { config, service });
+  assert.equal(JSON.parse(readFileSync(config.path, 'utf8')).language, undefined);
+  assert.equal(entries()[0].title, 'ccdt 的语言');
   await save(named('compaction.afterMinutes'), 45, { config, service });
   await save(named('web.enabled'), false, { config, service });
   await save(named('cli.autoCompactEnabled'), null, { config, service });
@@ -540,7 +586,7 @@ test('ccdt’s settings: its own waits, the service’s and Claude Code’s with
     entries({})
       .filter((entry) => entry.kind !== 'pending')
       .map((entry) => entry.name),
-    ['connection.connect', 'connection.ssh', 'connection.ready'],
+    ['ccdt.language', 'connection.connect', 'connection.ssh', 'connection.ready'],
   );
 });
 
